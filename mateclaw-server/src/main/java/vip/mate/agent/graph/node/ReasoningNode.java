@@ -38,16 +38,25 @@ import java.util.concurrent.CancellationException;
 import static vip.mate.agent.graph.state.MateClawStateKeys.*;
 
 /**
- * 推理节点（ReAct Thought 阶段）
- * <p>
- * 调用 LLM 进行单次推理，判断是否需要工具调用。
- * 关键：通过 internalToolExecutionEnabled=false 禁用 ChatModel 内部工具循环，
- * 使 StateGraph 完全控制 ReAct 循环。
- * <p>
- * 支持 forced_tool_call 机制：当审批通过后的重放请求到达时，
- * 跳过 LLM 调用，直接发出预批准的工具调用。
- * <p>
- * 使用 {@link NodeStreamingChatHelper} 进行流式调用，实时推送 content/thinking 增量。
+ * ============================================================
+ * 【ReAct 第1阶段：Thought】推理节点 — LLM 推理与工具决策
+ * ============================================================
+ * 角色：ReAct 循环的入口，也是每个新迭代的起点。
+ *
+ * 每次执行做的事情：
+ * 1. 从 state 获取当前消息列表（含历史+当前用户消息+前几轮的工具结果）
+ * 2. 组装 SystemMessage（系统提示词 + 技能目录 + 运行时上下文 + wiki + 进度账本）
+ * 3. 调用 LLM（禁用内部工具循环，让 StateGraph 完全控制）
+ * 4. 通过 NodeStreamingChatHelper 实时推送 content/thinking 流式增量
+ * 5. 解析 LLM 返回：
+ *    - 有 toolCalls → 设置 TOOL_CALLS + NEEDS_TOOL_CALL=true
+ *    - 无 toolCalls → 设置 FINAL_ANSWER（直接回答）
+ *    - 出错 → 设置 FINAL_ANSWER + finishReason=ERROR_FALLBACK
+ *
+ * 特殊机制：
+ * - forced_tool_call：审批通过后的重放，跳过 LLM 直接发出预批准的工具调用
+ * - 动态工具拆分：将扩展工具先隐藏，仅当 LLM 调用 enable_tool 后才暴露
+ * - 上下文窗口预算：防止单次 LLM 调用超出模型输入限制
  *
  * @author MateClaw Team
  */

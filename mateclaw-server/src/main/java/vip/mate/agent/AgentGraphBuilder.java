@@ -65,10 +65,24 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Agent 图构建器
- * <p>
- * 纯构建器，不做执行。从 AgentService 中提取出所有 Agent 实例构建逻辑，
- * 包括模型创建、图编译、prompt 增强等。
+ * ============================================================
+ * 【调用链路第3步】Agent 图构建器 — 构建 StateGraph 并编译
+ * ============================================================
+ * 角色：Agent 实例的"工厂"，负责：
+ * 1. 从 AgentEntity（数据库配置）创建完整的运行时 BaseAgent
+ * 2. 创建 ChatModel/ChatClient、组装 ToolExecutionExecutor
+ * 3. 构建 StateGraph 节点图 + 条件边（ReAct 循环的主体结构在此定义）
+ * 4. 编译 StateGraph → CompiledGraph 供 StateGraphReActAgent 执行
+ *
+ * 图结构（ReAct 模式）：
+ *   START → ReasoningNode ──┬──→ ActionNode → ObservationNode ──┐
+ *                            ├──→ SummarizingNode → ReasoningNode │
+ *                            ├──→ FinalAnswerNode                 │
+ *                            └──→ LimitExceededNode               │
+ *                                                                 │
+ *           ←─────────────────────────────────────────────────────┘
+ *   FinalAnswerNode → (有 goal 且未评估?) → GoalEvaluationNode → (followup?) → ReasoningNode
+ *                                       └→ END
  *
  * @author MateClaw Team
  */
@@ -393,7 +407,17 @@ public class AgentGraphBuilder {
 
         BaseAgent agent;
         boolean toolCallingEnabled;
+        /**
+         * ★ 模式分发 — ReAct 还是 Plan-Execute?
+         * 依据 agent_type 数据库字段决定：
+         *  - "plan_execute" → buildPlanExecuteAgent() → 任务分流 → 规划 → 逐步执行 → 汇总
+         *  - 其他(默认"react")  → buildReActAgent()     → 思考 → 行动 → 观察 → 循环
+         *
+         * 两种模式最终都返回 BaseAgent，并通过 StructuredStreamCapable 接口统一调度。
+         * Agent 实例被缓存到 AgentService.agentInstances 中，同一 (agentId, modelKey) 复用。
+         */
         if ("plan_execute".equals(entity.getAgentType())) {
+            /** ---- Plan-Execute 路径：适合复杂多步任务、需要先拆分再执行 ---- */
             agent = buildPlanExecuteAgent(toolSet, runtimeModel, maxIter, entity.getId(), skillCatalogRenderer);
             toolCallingEnabled = true;
             log.info("Built StateGraph Plan-Execute agent: {} (maxIterations={}, tools={}, protocol={})",
@@ -652,16 +676,37 @@ public class AgentGraphBuilder {
                     .addStrategy(MateClawStateKeys.ENABLED_EXTENSION_TOOLS, KeyStrategy.REPLACE)
                     .build();
 
-            // Graph 拓扑：
-            // START → PLAN_GENERATION → (PlanGenerationDispatcher)
-            //   ├→ DIRECT_ANSWER_NODE → END
-            //   └→ STEP_EXECUTION → (StepProgressDispatcher)
-            //       ├→ STEP_EXECUTION (loop)
-            //       └→ PLAN_SUMMARY → (active goal?)
-            //                          ├→ GOAL_EVALUATION → (followup?)
-            //                          │                     ├→ PLAN_GENERATION (re-plan)
-            //                          │                     └→ END
-            //                          └→ END
+            // ============================================================
+            // ★ Plan-Execute 图拓扑（完整的分流→执行→汇总流程）
+            // ============================================================
+            // 与 ReAct 的 "思考→行动→观察" 循环不同，Plan-Execute 采用
+            // "先规划再执行" 的策略，图结构如下：
+            //
+            // START
+            //   ↓
+            // [PlanGenerationNode]  ← LLM 任务分流器：判断是直接回答 / 单步 / 多步
+            //   ↓ (PlanGenerationDispatcher 两路分支)
+            //   ├──→ needsPlanning=false → [DirectAnswerNode]  → (goal?) → GoalEvaluation → END
+            //   │                             简单问答在此出口，不产生数据库 plan 记录
+            //   │
+            //   └──→ needsPlanning=true  → [StepExecutionNode]  ← 逐步执行（循环入口）
+            //                                   ↓ (StepProgressDispatcher 三路分支)
+            //                                   ├→ 还有步骤未完成 → StepExecutionNode（循环回自身）
+            //                                   ├→ awaiting_approval → END（审批暂停，等用户确认后重放）
+            //                                   ├→ plan_aborted（异常中止）→ END
+            //                                   └→ 所有步骤完成 → [PlanSummaryNode]
+            //                                                          ↓
+            //                                                       按步骤结果调 LLM 生成最终汇总
+            //                                                          ↓
+            //                                                 (active goal && 未评估?)
+            //                                                    ├→ GoalEvaluationNode → followup? → PlanGeneration(re-plan)
+            //                                                    └→ END
+            //
+            // 关键区别：
+            // - Plan-Execute 对外是"一个任务"，对内拆解为若干步骤，逐步执行
+            // - StepExecutionNode 内部有 while 循环（最多100轮），每轮就是一次 LLM推理→工具调用
+            // - 步骤间通过 working_context 传递已完成的上下文，避免 prompt 膨胀
+            // ============================================================
 
             GoalEvaluationNode goalEvalNode = new GoalEvaluationNode(
                     goalEvaluationService, goalFollowupService, goalService, goalProperties,
@@ -669,28 +714,39 @@ public class AgentGraphBuilder {
                     vip.mate.goal.service.GraphFlavor.PLAN_EXECUTE);
 
             StateGraph graph = new StateGraph("plan-execute-agent", keyStrategyFactory)
+                    // ===== 注册4个专用节点 + 1个共享节点 =====
                     .addNode(PlanStateKeys.PLAN_GENERATION_NODE,
-                            AsyncNodeAction.node_async(planGenerationNode))
+                            AsyncNodeAction.node_async(planGenerationNode))    // [节点1] 任务分流+规划
                     .addNode(PlanStateKeys.STEP_EXECUTION_NODE,
-                            AsyncNodeAction.node_async(stepExecutionNode))
+                            AsyncNodeAction.node_async(stepExecutionNode))     // [节点2] 逐步执行（核心）
                     .addNode(PlanStateKeys.PLAN_SUMMARY_NODE,
-                            AsyncNodeAction.node_async(planSummaryNode))
+                            AsyncNodeAction.node_async(planSummaryNode))       // [节点3] 最终汇总
                     .addNode(PlanStateKeys.DIRECT_ANSWER_NODE,
-                            AsyncNodeAction.node_async(directAnswerNode))
+                            AsyncNodeAction.node_async(directAnswerNode))      // [节点4] 简单问答出口
                     .addNode(MateClawStateKeys.GOAL_EVALUATION_NODE,
-                            AsyncNodeAction.node_async(goalEvalNode))
+                            AsyncNodeAction.node_async(goalEvalNode))          // [共享] 目标评估
+
+                    // ===== 定义图的边（执行流转）=====
+
+                    // 入口边：START → PlanGenerationNode（所有请求先进分流器）
                     .addEdge(StateGraph.START, PlanStateKeys.PLAN_GENERATION_NODE)
+
+                    // ★ 关键路由1：规划后 → 直接回答 or 步骤执行
                     .addConditionalEdges(PlanStateKeys.PLAN_GENERATION_NODE,
                             AsyncEdgeAction.edge_async(new PlanGenerationDispatcher()),
                             Map.of(
                                     PlanStateKeys.STEP_EXECUTION_NODE, PlanStateKeys.STEP_EXECUTION_NODE,
                                     PlanStateKeys.DIRECT_ANSWER_NODE, PlanStateKeys.DIRECT_ANSWER_NODE))
+
+                    // ★ 关键路由2：步骤执行后 → 继续/暂停/汇总（这是步骤循环的核心）
                     .addConditionalEdges(PlanStateKeys.STEP_EXECUTION_NODE,
                             AsyncEdgeAction.edge_async(new StepProgressDispatcher()),
                             Map.of(
                                     PlanStateKeys.STEP_EXECUTION_NODE, PlanStateKeys.STEP_EXECUTION_NODE,
                                     PlanStateKeys.PLAN_SUMMARY_NODE, PlanStateKeys.PLAN_SUMMARY_NODE,
                                     StateGraph.END, StateGraph.END))
+
+                    // 汇总后 → (有Goal且未评估?) → GoalEvaluation : END
                     .addConditionalEdges(PlanStateKeys.PLAN_SUMMARY_NODE,
                             AsyncEdgeAction.edge_async(state -> {
                                 MateClawStateAccessor a = new MateClawStateAccessor(state);
@@ -703,19 +759,21 @@ public class AgentGraphBuilder {
                             Map.of(
                                     MateClawStateKeys.GOAL_EVALUATION_NODE, MateClawStateKeys.GOAL_EVALUATION_NODE,
                                     StateGraph.END, StateGraph.END))
+
+                    // GoalEvaluation → (需要跟进?) → 重新规划 : END
+                    // ★ 注意：re-plan 的目标是 PlanGenerationNode（而非 ReAct 的 ReasoningNode）
+                    //    这意味着评估后若需跟进，会带着 followup 提示重新做一次任务分流
                     .addConditionalEdges(MateClawStateKeys.GOAL_EVALUATION_NODE,
                             AsyncEdgeAction.edge_async(new vip.mate.agent.graph.edge.GoalEvaluationDispatcher(
                                     PlanStateKeys.PLAN_GENERATION_NODE, StateGraph.END)),
                             Map.of(
                                     PlanStateKeys.PLAN_GENERATION_NODE, PlanStateKeys.PLAN_GENERATION_NODE,
                                     StateGraph.END, StateGraph.END))
-                    // DIRECT_ANSWER_NODE handles trivial requests that bypass the
-                    // multi-step plan. For active goals, the direct answer is still
-                    // a turn — without this edge, turns_used / score / completion
-                    // would never tick on plan-execute conversations whose every
-                    // reply happened to be simple enough to short-circuit through
-                    // the direct path. Mirror PLAN_SUMMARY_NODE's gate so non-goal
-                    // turns still go straight to END (no goal node invocation).
+
+                    // 直接回答后 → (有Goal且未评估?) → GoalEvaluation : END
+                    // 注意：Plan-Execute 中即使是 simple question 也可能属于某个
+                    //       active goal，所以 DIRECT_ANSWER_NODE 也要像 PLAN_SUMMARY_NODE
+                    //       一样连接到 GoalEvaluation，确保目标进度有更新
                     .addConditionalEdges(PlanStateKeys.DIRECT_ANSWER_NODE,
                             AsyncEdgeAction.edge_async(state -> {
                                 MateClawStateAccessor a = new MateClawStateAccessor(state);
@@ -922,37 +980,54 @@ public class AgentGraphBuilder {
                     vip.mate.goal.service.GraphFlavor.REACT);
 
             StateGraph graph = new StateGraph("react-agent-v2", keyStrategyFactory)
+                    // ===== 注册所有节点 =====
                     .addNode(MateClawStateKeys.REASONING_NODE,
-                            AsyncNodeAction.node_async(reasoningNode))
+                            AsyncNodeAction.node_async(reasoningNode))   // [节点1] LLM推理
                     .addNode(MateClawStateKeys.ACTION_NODE,
-                            AsyncNodeAction.node_async(actionNode))
+                            AsyncNodeAction.node_async(actionNode))       // [节点2] 工具执行
                     .addNode(MateClawStateKeys.OBSERVATION_NODE,
-                            AsyncNodeAction.node_async(observationNode))
+                            AsyncNodeAction.node_async(observationNode))  // [节点3] 结果处理
                     .addNode(MateClawStateKeys.SUMMARIZING_NODE,
-                            AsyncNodeAction.node_async(summarizingNode))
+                            AsyncNodeAction.node_async(summarizingNode))  // [节点4] 上下文压缩
                     .addNode(MateClawStateKeys.LIMIT_EXCEEDED_NODE,
-                            AsyncNodeAction.node_async(limitExceededNode))
+                            AsyncNodeAction.node_async(limitExceededNode))// [节点5] 超限处理
                     .addNode(MateClawStateKeys.FINAL_ANSWER_NODE,
-                            AsyncNodeAction.node_async(finalAnswerNode))
+                            AsyncNodeAction.node_async(finalAnswerNode))  // [节点6] 最终回答
                     .addNode(MateClawStateKeys.GOAL_EVALUATION_NODE,
-                            AsyncNodeAction.node_async(goalEvalNode))
+                            AsyncNodeAction.node_async(goalEvalNode))     // [节点7] 目标评估
+
+                    // ===== 定义图的边（执行流转） =====
+                    // 入口边：START → ReasoningNode
                     .addEdge(StateGraph.START, MateClawStateKeys.REASONING_NODE)
+
+                    // ★ 核心循环：ReasoningNode 的条件分支
+                    //   推理后根据结果决定走向：工具调用 / 总结 / 直接回答 / 超限
                     .addConditionalEdges(MateClawStateKeys.REASONING_NODE,
                             AsyncEdgeAction.edge_async(new ReasoningDispatcher()),
                             Map.of(MateClawStateKeys.ACTION_NODE, MateClawStateKeys.ACTION_NODE,
                                     MateClawStateKeys.SUMMARIZING_NODE, MateClawStateKeys.SUMMARIZING_NODE,
                                     MateClawStateKeys.FINAL_ANSWER_NODE, MateClawStateKeys.FINAL_ANSWER_NODE,
                                     MateClawStateKeys.LIMIT_EXCEEDED_NODE, MateClawStateKeys.LIMIT_EXCEEDED_NODE))
+
+                    // 固定边：Action → Observation
                     .addEdge(MateClawStateKeys.ACTION_NODE, MateClawStateKeys.OBSERVATION_NODE)
+
+                    // ★ 核心循环：ObservationNode 的条件分支
+                    //   观察后决定：继续推理 / 总结 / 超限 / 审批等待→直接回答
                     .addConditionalEdges(MateClawStateKeys.OBSERVATION_NODE,
                             AsyncEdgeAction.edge_async(new ObservationDispatcher()),
                             Map.of(MateClawStateKeys.REASONING_NODE, MateClawStateKeys.REASONING_NODE,
                                     MateClawStateKeys.SUMMARIZING_NODE, MateClawStateKeys.SUMMARIZING_NODE,
                                     MateClawStateKeys.LIMIT_EXCEEDED_NODE, MateClawStateKeys.LIMIT_EXCEEDED_NODE,
                                     MateClawStateKeys.FINAL_ANSWER_NODE, MateClawStateKeys.FINAL_ANSWER_NODE))
+
+                    // 固定边：Summarizing → Reasoning（压缩后继续循环）
                     .addEdge(MateClawStateKeys.SUMMARIZING_NODE, MateClawStateKeys.REASONING_NODE)
+
+                    // 固定边：LimitExceeded → FinalAnswer
                     .addEdge(MateClawStateKeys.LIMIT_EXCEEDED_NODE, MateClawStateKeys.FINAL_ANSWER_NODE)
-                    // FinalAnswer -> (active goal && not yet evaluated this run) ? GoalEvaluation : END
+
+                    // ★ 终止边：FinalAnswer → (有目标且未评估?) → GoalEvaluation : END
                     .addConditionalEdges(MateClawStateKeys.FINAL_ANSWER_NODE,
                             AsyncEdgeAction.edge_async(state -> {
                                 MateClawStateAccessor a = new MateClawStateAccessor(state);
@@ -965,7 +1040,8 @@ public class AgentGraphBuilder {
                             Map.of(
                                     MateClawStateKeys.GOAL_EVALUATION_NODE, MateClawStateKeys.GOAL_EVALUATION_NODE,
                                     StateGraph.END, StateGraph.END))
-                    // GoalEvaluation -> (followup injected) ? Reasoning : END
+
+                    // GoalEvaluation → (需要跟进?) → Reasoning : END
                     .addConditionalEdges(MateClawStateKeys.GOAL_EVALUATION_NODE,
                             AsyncEdgeAction.edge_async(new vip.mate.agent.graph.edge.GoalEvaluationDispatcher(
                                     MateClawStateKeys.REASONING_NODE, StateGraph.END)),

@@ -24,17 +24,55 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * 基于 StateGraph 的 Plan-Execute Agent
- * <p>
- * 使用 spring-ai-alibaba-graph-core 的 StateGraph 引擎实现：
- * <ol>
- *   <li>简单问答快速退出（PlanGenerationNode 前置判断）</li>
- *   <li>多步任务：规划 → 逐步执行（带工具调用）→ 汇总</li>
- * </ol>
- * <p>
- * content_delta 和 thinking_delta 由节点内 NodeStreamingChatHelper 直推，
- * chatStructuredStream() 只处理 phase/tool/plan/step 等结构化事件。
- * 不再从 NodeOutput 二次整段下发已流式推送的内容。
+ * ============================================================
+ * 【Plan-Execute 主执行体】— 基于 StateGraph 的先规划后执行 Agent
+ * ============================================================
+ *
+ * 角色：Plan-Execute 模式的"驱动层"—— 负责构建初始状态、启动图执行、处理结果流。
+ * 与 StateGraphReActAgent 同一层级，共同继承 BaseAgent 并实现 StructuredStreamCapable。
+ *
+ * 为什么需要这个类（而不在 AgentGraphBuilder 里直接调 compiledGraph.stream()）？
+ * 1. 封装初始状态构建（buildInitialState）：加载对话历史、裁剪窗口、压缩 working context、
+ *    注入 active goal 快照 —— 这些逻辑 ReAct 也有但细节不同，需要在各自的 Agent 实现中处理
+ * 2. 封装流执行逻辑（executeStream）：处理 NodeOutput → 提取事件/步骤结果/汇总/去重 → StreamDelta
+ * 3. 支持审批重放（chatWithReplayStream）：从 DB 恢复上下文，注入预批准工具调用，重新启动图
+ * 4. 实现 AgentService 的统一接口（chat/chatStream/chatStructuredStream），供 Controller 层调用
+ *
+ * 完整调用链路（从 HTTP 请求到 SSE 响应）：
+ *
+ *   AgentController → AgentService.chatStructured(agentId, msg)
+ *     → getOrCreateAgent() 从缓存获取 this(StateGraphPlanExecuteAgent)
+ *     → this.chatStructuredStream(userMessage, conversationId, requesterId)
+ *       → buildInitialState(userMessage, conversationId)
+ *         → buildConversationHistory() 加载历史消息
+ *         → conversationWindowManager.fitToWindow() 裁剪窗口
+ *         → buildCurrentUserMessageWithRouting() 构建当前消息（含路由决策）
+ *         → buildWorkingContext(history, List.of()) 压缩对话历史摘要
+ *         → 注入 GOAL, SYSTEM_PROMPT, MESSAGES, WORKING_CONTEXT, ChatOrigin, active goal 快照...
+ *       → executeStream(inputs)
+ *         → routingStartupDelta() 前置"正在分析..."提示
+ *         → compiledGraph.stream(inputs, config) 启动 StateGraph 流式执行
+ *           → START → PlanGenerationNode(分流) → StepExecutionNode(执行)循环 → PlanSummaryNode(汇总) → END
+ *         → 逐节点处理 NodeOutput:
+ *            - 提取 PENDING_EVENTS → SSE 结构化事件（planCreated/stepStarted/phase/perfSummary...）
+ *            - 提取 CURRENT_STEP_RESULT → persistOnly StreamDelta（已流式推送的不重复推）
+ *            - 提取 FINAL_SUMMARY → StreamDelta（ChatController 收集后写入 mate_message 表）
+ *            - 提取 token usage → _usage_final 事件
+ *         → doOnComplete: setState(IDLE)
+ *         → doOnError: setState(ERROR)
+ *
+ * ReAct vs Plan-Execute 对比：
+ * ┌──────────────────────────────────────────────────────────────┐
+ * │ Plan-Execute (本类)：先做一次 LLM 调用做任务分流（是否需要规划?）│
+ * │                                                    │          │
+ * │  ┌─ 不需要 → 直接回答出口                           │          │
+ * │  └─ 需要   → 拆解为1-6步 → 逐步执行 → 汇总回答     │          │
+ * └──────────────────────────────────────────────────────────────┘
+ *
+ * ┌──────────────────────────────────────────────────────────────┐
+ * │ ReAct：进入"思考→行动→观察"循环，每一步都是一次完整推理      │
+ * │    ReasoningNode → ActionNode → ObservationNode → (循环)     │
+ * └──────────────────────────────────────────────────────────────┘
  *
  * @author MateClaw Team
  */
@@ -74,6 +112,28 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
         return chatStructuredStream(userMessage, conversationId, "");
     }
 
+    /**
+     * 【主入口：新对话 / 新消息】Plan-Execute 流式对话。
+     *
+     * 被谁调用：
+     *   AgentController → AgentService.chatStructured(agentId, msg, convId, requesterId)
+     *     → 从 agentInstances 缓存中获取 this(StateGraphPlanExecuteAgent)
+     *     → this.chatStructuredStream(msg, convId, requesterId)
+     *
+     * 内部调用链：
+     *   1. setState(RUNNING) — 状态机切换到运行中
+     *   2. buildInitialState(userMessage, conversationId) — 构建初始状态 Map
+     *      → 内部调用 buildConversationHistory, fitToWindow, buildWorkingContext,
+     *        buildCurrentUserMessageWithRouting, 注入 active goal 等
+     *   3. 注入 REQUESTER_ID — 标识发起者（IM 渠道用户名 / Web 登录名）
+     *   4. executeStream(inputs) — 驱动 compiledGraph 流式执行
+     *      → 内部 routingStartupDelta → compiledGraph.stream → 逐节点提取 StreamDelta
+     *   5. 异常时 setState(ERROR) + Flux.error
+     *
+     * 与 ReAct 的 chatStructuredStream 相比：
+     *   多了 buildWorkingContext 步骤（对话历史压缩成摘要，避免 prompt 膨胀）
+     *   没有 maxIterations / currentIteration（步骤循环由 StepProgressDispatcher 自驱动）
+     */
     @Override
     public Flux<AgentService.StreamDelta> chatStructuredStream(String userMessage, String conversationId,
                                                                 String requesterId) {
@@ -89,6 +149,27 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
         }
     }
 
+    /**
+     * 【审批重放入口】工具调用被 ToolGuard 拦截 → 用户在前端确认 → 通过此方法重新执行。
+     *
+     * 被谁调用：
+     *   AgentController（审批确认 API）→ AgentService.chatWithReplay(agentId, msg, convId, toolCallPayload)
+     *     → 从缓存获取 this → this.chatWithReplayStream(msg, convId, payload)
+     *
+     * 与 chatStructuredStream 的关键区别：
+     * 1. 从 DB 恢复 awaiting_approval 状态（planningService.findAwaitingApprovalContext()）:
+     *    → 取出 planId, steps, awaitingStepIndex, completedResults
+     * 2. 重建 working context（历史消息 + 已完成步骤摘要）
+     * 3. 注入 PRE_APPROVED_TOOL_CALL → StepExecutionNode 匹配工具名后跳过 ToolGuard 直接调用 executePreApproved()
+     *
+     * 后续调用链（注入 state 后进入图）：
+     *   → executeStream → compiledGraph.stream → START → PlanGenerationNode
+     *     → 检测到 PLAN_ID 已存在 → 跳过 LLM 分流，直接返回 needsPlanning(true) + 复用已有计划
+     *     → PlanGenerationDispatcher → StepExecutionNode
+     *     → 检测到 PRE_APPROVED_TOOL_CALL → 匹配工具名 → 调用 executePreApproved → 继续执行
+     *
+     * ★ 关键设计：currentStepIndex 不递增 — 从暂停的同一步继续执行，不跳步
+     */
     @Override
     public Flux<AgentService.StreamDelta> chatWithReplayStream(String userMessage, String conversationId,
                                                                 String toolCallPayload) {
@@ -134,7 +215,35 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
         }
     }
 
-    /** 公共流执行逻辑，由 chatStructuredStream 和 chatWithReplayStream 共用 */
+    /**
+     * 【核心执行引擎】被 chatStructuredStream 和 chatWithReplayStream 共用。
+     *
+     * 执行过程（时间线）：
+     * 1. 生成独立 threadId（UUID）→ 确保图状态不跨请求泄漏（每次对话独立开辟 StateGraph session）
+     * 2. 前置 routingStartupDelta（"正在分析..."）→ 前端在分流阶段（1-3秒静默）有进度展示
+     * 3. compiledGraph.stream(inputs, config) → 启动 StateGraph 流式执行
+     *    → START → [PlanGenerationNode] → (dispatch) → [StepExecutionNode] ↩ → [PlanSummaryNode] → END
+     *    → 每个节点执行完后触发 NodeOutput 回调（flatMapIterable 中的 lambda）
+     * 4. 逐节点处理 NodeOutput → 产出 StreamDelta Flux：
+     *    a. 提取 PENDING_EVENTS → 增量发送结构化事件（只发新增部分）
+     *    b. CURRENT_STEP_RESULT / CURRENT_STEP_THINKING → persistOnly（已流式推送过，只持久化不重复推）
+     *    c. FINAL_SUMMARY / FINAL_SUMMARY_THINKING → persistOnly or new StreamDelta（取决于是否已流式推送）
+     *    d. 累加 token usage（PROMPT_TOKENS / COMPLETION_TOKENS / RUNTIME_MODEL_NAME）
+     * 5. .concatWith(_usage_final 事件) → 流结束后的最终 token 统计事件
+     * 6. .doOnComplete: setState(IDLE) | .doOnError: setState(ERROR)
+     *
+     * 去重机制（Plan-Execute 特有）：
+     * - StepExecutionNode 的 while 循环中每次 LLM 调用都被 NodeStreamingChatHelper.streamCall()
+     *   实时推送到 SSE（属于"已流式推送"内容），但 NodeOutput 回调中可能同样 emit 这些结果
+     * - lastPersistedStepResult / lastPersistedStepThinking：内容级去重
+     *   因为 PlanSummaryNode 输出时 state 中可能残留上一步的值被重复提取
+     *
+     * 与 ReAct 的 executeStream 对比：
+     * - ReAct 只提取 FINAL_ANSWER，Plan-Execute 多了 CURRENT_STEP_RESULT / CURRENT_STEP_THINKING
+     *   和 FINAL_SUMMARY_THINKING 的提取逻辑
+     * - ReAct 没有 persistOnly 概念（所有内容都通过 StreamDelta 下发），
+     *   Plan-Execute 的步骤内容由 StepExecutionNode 直推 SSE，此处只做持久化
+     */
     private Flux<AgentService.StreamDelta> executeStream(Map<String, Object> inputs) {
         String threadId = UUID.randomUUID().toString();
         RunnableConfig config = RunnableConfig.builder().threadId(threadId).build();
@@ -251,6 +360,36 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
         return chat(goal, conversationId);
     }
 
+    /**
+     * 【初始状态构建】在图执行前将 Agent 配置、历史、约束打包成 StateGraph 输入 Map。
+     *
+     * 这个方法产出的 Map 就是图的"初始全局状态"，引擎会将此 Map 作为 OverAllState 传给
+     * 第一个节点（PlanGenerationNode）。
+     *
+     * 写入哪些键（"谁消费"列说明这些值最终被哪个节点/方法读取）：
+     *
+     *   GOAL = userMessage                        → PlanGenerationNode 分流判断 + StepExecutionNode 展示总目标
+     *   SYSTEM_PROMPT                             → PlanGenerationNode / StepExecutionNode 构建系统消息
+     *   CONVERSATION_ID                           → streamingHelper 的 SSE 广播路径
+     *   AGENT_ID                                  → 日志关联
+     *   MESSAGES（对话历史 + 当前UserMessage）     → StepExecutionNode 的 rebuildWorkingContext 做压缩
+     *   WORKING_CONTEXT（buildWorkingContext 产出）→ PlanGenerationNode / StepExecutionNode 避免反复读完整历史
+     *   CURRENT_STEP_INDEX = 0                    → StepExecutionNode 从第 0 步开始
+     *   CONTENT_STREAMED / THINKING_STREAMED = false → executeStream 的去重标记
+     *   PROMPT_TOKENS / COMPLETION_TOKENS = 0     → mergeUsage 累加的起始值
+     *   RUNTIME_MODEL_NAME / RUNTIME_PROVIDER_ID  → _usage_final 事件上报
+     *   TRACE_ID（UUID 前 8 位）                  → 日志链路追踪
+     *   ROUTING_DECISION（多模态路由结果）          → PlanGenerationNode 考虑路由偏好
+     *   CHAT_ORIGIN                               → DelegateAgentTool 子图继承渠道信息
+     *   ACTIVE_GOAL                               → GoalEvaluationNode 目标进度评估
+     *   GOAL_EVALUATED_THIS_RUN = false           → 避免同一图执行重复评估
+     *   GOAL_FOLLOWUP_PROMPT = ""                 → PlanGenerationNode 跟进提示注入
+     *
+     * 与 ReAct 的 buildInitialState 对比：
+     *   相同：对话历史加载、窗口裁剪、当前消息构建、active goal 注入
+     *   不同：没有 maxIterations/currentIteration（步骤循环由 StepProgressDispatcher 自驱动）、
+     *        多了 GOAL + WORKING_CONTEXT + 预初始 Plan-Execute 键、多了 buildWorkingContext 调用
+     */
     private Map<String, Object> buildInitialState(String userMessage, String conversationId) {
         // 加载会话历史（复用 BaseAgent.buildConversationHistory，与 ReAct 对齐）
         List<Message> historyMessages = buildConversationHistory(conversationId, userMessage);
@@ -341,17 +480,28 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
     }
 
     /**
-     * 构建受控长度的 working context。
-     * <p>
-     * 将会话历史 + 已完成步骤结果压缩为结构化摘要块，
-     * 避免 prompt 随对话和步骤执行无限膨胀。
-     * <p>
-     * 规则：
-     * <ul>
-     *   <li>历史消息：保留最近 MAX_HISTORY_MESSAGES 条，每条截断至 MAX_MSG_CHARS 字符</li>
-     *   <li>步骤结果：保留最近 MAX_STEP_RESULTS 条，每条截断至 MAX_STEP_CHARS 字符</li>
-     *   <li>总体截断至 MAX_CONTEXT_CHARS 字符</li>
-     * </ul>
+     * 【上下文压缩】将对话历史 + 已完成步骤结果压缩为受控长度（≤6000 字符）的摘要。
+     *
+     * 被谁调用：
+     *   - buildInitialState()：图执行前压缩对话历史（步骤结果为空 List）
+     *   - chatWithReplayStream()：审批重放时重建 working context（含已完成步骤结果）
+     *
+     * 为什么需要这个机制（而不直接把 MESSAGES 传给每个节点的 Prompt）？
+     *   多步执行中，每步的 Prompt 都包含"完整对话历史 + 所有已完成步骤结果"会导致：
+     *   - 第 1 步：Prompt 大小 = 对话历史 + 1 步结果 → 还行
+     *   - 第 4 步：Prompt 大小 = 对话历史 + 4 步结果 → 开始变大
+     *   - 第 6 步：Prompt 大小 = 对话历史 + 6 步结果 → 可能超过模型 context window
+     *   通过 WORKING_CONTEXT 压缩传递，每步的 Prompt 只追加 ≤6000 字符的摘要，
+     *   不随步骤数线性膨胀。
+     *
+     * 压缩规则：
+     *   - 历史消息：保留最近 10 条，每条截断至 500 字符
+     *   - 步骤结果：保留最近 5 条，每条截断至 800 字符
+     *   - 总体截断至 6000 字符
+     *
+     * 与 ReAct 的 SummarizingNode 对比：
+     *   - ReAct：SummarizingNode 将压缩后的摘要追加到 MESSAGES，和原始消息混在一起
+     *   - Plan-Execute：WORKING_CONTEXT 独立一个键，不修改 MESSAGES，职责分离更清晰
      */
     static String buildWorkingContext(List<Message> historyMessages, List<String> completedResults) {
         StringBuilder sb = new StringBuilder();

@@ -32,10 +32,19 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
- * Agent 业务服务
- * <p>
- * 负责 Agent 的 CRUD 管理和运行时实例管理。
- * 构建逻辑委托给 {@link AgentGraphBuilder}。
+ * ============================================================
+ * 【调用链路第2步】Agent 业务服务 — 运行时入口 + CRUD + 缓存管理
+ * ============================================================
+ * 角色：Agent 的统一门面，负责：
+ * 1. Agent 的 CRUD（创建、查询、更新、删除）
+ * 2. 运行时 Agent 实例的缓存（agentId → BaseAgent）—— 避免每次对话都重新构建图
+ * 3. 提供 chat/chatStream/execute 入口，内部委托给 BaseAgent 子类
+ *
+ * 调用链：
+ *   chatStream(agentId, message, conversationId)
+ *     → getOrBuildAgentForConversation()  // 获取或构建缓存的 Agent
+ *         → agentGraphBuilder.build()     // 构建完整的 StateGraph + 编译
+ *     → agent.chatStream()               // 委托到 StateGraphReActAgent
  *
  * @author MateClaw Team
  */
@@ -311,6 +320,11 @@ public class AgentService {
                 ChatOrigin.EMPTY);
     }
 
+    /**
+     * 【主入口】结构化流式对话 — 生产环境的主要调用路径。
+     * 当 agent 实现了 StructuredStreamCapable（即 StateGraphReActAgent），
+     * 直接调用 chatStructuredStream；否则降级为普通 chatStream。
+     */
     public Flux<StreamDelta> chatStructuredStream(Long agentId, String message, String conversationId,
                                                    String requesterId, String thinkingLevel,
                                                    ChatOrigin origin) {
@@ -580,6 +594,16 @@ public class AgentService {
      * partially-cleared admin UI write could end up cached as a key like
      * {@code "volcano::"} which {@link #getOrBuildAgent} would then try to
      * build, only to fail at provider-resolution time on every turn.
+     */
+    /**
+     * 【核心方法】解析并缓存 Agent 的运行时图实例。
+     * 优先使用会话级 pinned model；无 pin 则回退到 Agent 默认模型 / 全局默认。
+     *
+     * 缓存策略：
+     *   agentInstances: Map<agentId, Map<modelKey, BaseAgent>>
+     *   - modelKey = ""   → Agent/全局默认模型
+     *   - modelKey = "provider::model" → 会话 pin 的特定模型
+     *   每个 (agentId, modelKey) 组合对应一个独立的已编译 StateGraph
      */
     private BaseAgent getOrBuildAgentForConversation(Long agentId, String conversationId) {
         String provider = null;

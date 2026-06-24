@@ -1,12 +1,24 @@
 package vip.mate.agent.graph.state;
 
 /**
- * MateClaw 增强版状态键常量
- * <p>
- * 包含原 ReActStateKeys 的所有字段，并新增 summarizing、超限处理、
- * 观察压缩等字段，支撑完整的标准 ReAct 状态图。
- * <p>
- * 所有节点和路由统一引用此类，避免字符串散落。
+ * ============================================================
+ * 【核心定义】MateClaw StateGraph 状态键常量
+ * ============================================================
+ * 所有节点和路由统一引用此类的常量，避免硬编码字符串散落各处。
+ *
+ * 两大策略类型：
+ * - REPLACE: 节点输出覆盖同名键（如 TOOL_CALLS, FINAL_ANSWER）
+ * - APPEND:  节点输出追加到同名键（如 MESSAGES, PENDING_EVENTS）
+ *
+ * 关键状态键分组：
+ * - 输入: USER_MESSAGE, CONVERSATION_ID, SYSTEM_PROMPT, AGENT_ID
+ * - 消息: MESSAGES（APPEND策略，每轮追加）
+ * - 迭代: CURRENT_ITERATION, MAX_ITERATIONS
+ * - 工具: TOOL_CALLS, TOOL_RESULTS, TOOL_CALL_COUNT
+ * - 控制: FINAL_ANSWER, NEEDS_TOOL_CALL, ERROR, FINISH_REASON
+ * - 终止: LIMIT_EXCEEDED, AWAITING_APPROVAL
+ * - 上下文: OBSERVATION_HISTORY, SUMMARIZED_CONTEXT, SHOULD_SUMMARIZE
+ * - 统计: PROMPT_TOKENS, COMPLETION_TOKENS, LLM_CALL_COUNT
  *
  * @author MateClaw Team
  */

@@ -17,12 +17,24 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 计划汇总节点
- * <p>
- * 汇总所有步骤结果，调 LLM 生成最终总结，
- * 调 planningService.completePlan() 标记计划完成。
- * <p>
- * 使用 {@link NodeStreamingChatHelper} 进行流式调用，实时推送 content/thinking 增量。
+ * ============================================================
+ * 【Plan-Execute 第4阶段：Summarize】计划汇总节点 — 生成最终回答
+ * ============================================================
+ * 角色：所有步骤执行完毕后，由本节点汇总步骤结果，调用 LLM 生成最终的用户回答。
+ *
+ * 工作流程：
+ * 1. 从 state 读取 GOAL（用户目标）+ COMPLETED_RESULTS（各步结果）+ WORKING_CONTEXT
+ * 2. 组装总结 Prompt：原始目标 + 对话上下文 + 各步骤执行结果
+ * 3. 调 LLM 生成简洁完整的最终回答（而不是逐步骤罗列）
+ * 4. 调 planningService.completePlan() 标记计划完成
+ *
+ * 降级策略：
+ * LLM 调用失败 → buildFallbackSummary() 本地生成降级摘要（直接拼接步骤原始结果）
+ *
+ * 与 ReAct 的 FinalAnswerNode 对比：
+ *  - FinalAnswerNode 处理的是单轮推理的最终答案（含证据校验、虚假链接清洗）
+ *  - PlanSummaryNode 处理的是多步汇总，更注重"不要罗列步骤，给一个完整回答"
+ *  - FinalAnswerNode 有证据校验功能，PlanSummaryNode 没有（步骤结果本身是"证据"）
  *
  * @author MateClaw Team
  */
@@ -48,6 +60,12 @@ public class PlanSummaryNode implements NodeAction {
         this(chatModel, planningService, null);
     }
 
+    /**
+     * ★ Plan-Execute 最后一站 — 汇总步骤结果生成最终回答。
+     * 输入: GOAL + COMPLETED_RESULTS(累积,APPEND) + WORKING_CONTEXT
+     * 输出: FINAL_SUMMARY → executeStream → ChatController → mate_message
+     * 降级: LLM失败 → buildFallbackSummary() 本地拼接
+     */
     @Override
     public Map<String, Object> apply(OverAllState state) throws Exception {
         PlanStateAccessor accessor = new PlanStateAccessor(state);

@@ -15,17 +15,24 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 最终回答节点
- * <p>
- * 汇聚所有终止路径的最终回答生成：
- * <ul>
- *   <li>直接回答路径：使用 ReasoningNode 产出的 finalAnswer</li>
- *   <li>Summarizing 路径：基于 summarizedContext 构建回答</li>
- *   <li>LimitExceeded 路径：使用 finalAnswerDraft</li>
- * </ul>
- * <p>
- * 负责设置最终的 finalAnswer、finalThinking 和 finishReason。
- * 保留上游节点设置的 CONTENT_STREAMED / THINKING_STREAMED 标志位。
+ * ============================================================
+ * 【ReAct 终点】最终回答节点 — 所有终止路径的汇聚点
+ * ============================================================
+ * 角色：无论从哪个路径到达终点，都在此处生成/组织最终的助手回复。
+ *
+ * 处理的路径（按优先级）：
+ * 1. RETURN_DIRECT   → 工具输出直接作为回答（跳过 LLM 调用）
+ * 2. AWAITING_APPROVAL → 保留已流式推送的内容，等待审批完成后持久化
+ * 3. finalAnswerDraft → 来自 SummarizingNode / LimitExceededNode 的草稿
+ * 4. finalAnswer      → 来自 ReasoningNode 的直接回答
+ * 5. summarizedContext → 兜底：无 draft 也无 finalAnswer 时使用压缩上下文
+ * 6. 硬兜底           → "Failed to generate a response..."
+ *
+ * 附加值：
+ * - 证据校验：通过 SourceEvidenceLedger 校验 LLM 的引用是否有真实工具证据支撑
+ * - 虚假文件链接清洗：检查 LLM 编造的 /api/v1/files/generated/{id} URL
+ * - Markdown 规范化：自动修复 LLM 输出的不规范 Markdown 格式
+ * - 终止原因标记：设置 finishReason（NORMAL/SUMMARIZED/EVIDENCE_INSUFFICIENT/...）
  *
  * @author MateClaw Team
  */

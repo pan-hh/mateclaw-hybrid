@@ -34,18 +34,30 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 步骤执行节点
- * <p>
- * 执行当前步骤，使用显式工具执行循环（internalToolExecutionEnabled=false）。
- * 单步最大工具调用次数限制为 {@link #MAX_TOOL_CALLS_PER_STEP} 次，与
- * {@code BaseAgent.MAX_ITERATIONS_HARD_CEILING} 对齐——因此实际生效的上限
- * 永远是 agent 的 {@code max_iterations}（DB 列），单步本身不会先于 agent
- * 的整体预算被打掉。早期 5 次的硬限制对"查新闻 + 整理 Word"这种合理多
- * 工具任务过紧，被 LimitExceededNode 提前拦截后用户看到的是冷冰冰的
- * "工具调用次数超出最大限制"。
- * <p>
- * 支持 NEEDS_APPROVAL 审批流程：对需要审批的工具调用创建 pending，
- * 发出 SSE 事件后立即返回审批提示（非阻塞）。审批通过后通过 replay 重新执行。
+ * ============================================================
+ * 【Plan-Execute 第3阶段：Execute】步骤执行节点 — Plan-Execute 的核心
+ * ============================================================
+ * 这是整个 Plan-Execute 流程中最复杂、最重要的节点。每个"步骤"在这里
+ * 内部以一个 ReAct 风格的 while 循环来执行（LLM推理 → 工具调用 → 观察），
+ * 直到 LLM 不再请求工具为止，然后该步骤的结果被推送出去。
+ *
+ * 与 ReAct 的 ActionNode 对比：
+ * ┌──────────────────────────┬──────────────────────────────────┐
+ * │ ReAct ActionNode         │ Plan-Execute StepExecutionNode   │
+ * ├──────────────────────────┼──────────────────────────────────┤
+ * │ 由 StateGraph 引擎驱动    │ 内部 while 循环自驱动           │
+ * │ 每次只做一次 LLM→工具→观察 │ 每个步骤内部做多次 LLM→工具循环 │
+ * │ maxIterations=150        │ MAX_TOOL_CALLS_PER_STEP=100      │
+ * │ 结果走 ObservationDispatcher│ 结果走 StepProgressDispatcher   │
+ * └──────────────────────────┴──────────────────────────────────┘
+ *
+ * 关键机制：
+ * 1. while 循环（最多100轮）：每轮 = LLM推理 → 工具调用 → 观察结果 → 继续/结束
+ * 2. wall-clock 超时保护：单步最多10分钟（防止 LLM 流停转或同步工具挂起）
+ * 3. 审批暂停/重放：need_approval 工具触发 → 设置 awaiting_approval → 图暂停
+ *    → 用户确认 → chatWithReplayStream → 注入 PRE_APPROVED_TOOL_CALL → 跳过 ToolGuard
+ * 4. returnDirect 短路（RFC-052）：工具标记 returnDirect=true → 整个计划终止
+ * 5. 增量 working context 更新：首步重建 → 后续追加（O(1) 而非每次 O(N) 重建）
  *
  * @author MateClaw Team
  */
@@ -148,6 +160,52 @@ public class StepExecutionNode implements NodeAction {
         this.stepWallClockTimeoutMs = stepWallClockTimeoutMs;
     }
 
+    /**
+     * ★ Plan-Execute 的核心节点 — 每个步骤在这里被拆解为多轮 LLM推理→工具调用→观察的 while 循环。
+     *
+     * 输入（从 OverAllState 读取）：
+     *   PLAN_STEPS — 步骤列表，PlanGenerationNode 写入
+     *   CURRENT_STEP_INDEX — 当前步骤索引，PlanGenerationNode 初始化为 0，本节点每步完成后 +1
+     *   GOAL — 用户原始目标
+     *   SYSTEM_PROMPT — Agent 系统提示词
+     *   WORKING_CONTEXT — 对话+步骤的压缩摘要
+     *   PRE_APPROVED_TOOL_CALL — 审批重放时注入（有则跳过 ToolGuard）
+     *
+     * 内部执行的三段式 while 循环：
+     *
+     *   while (toolCallCount < 100 && not timeout):
+     *     ┌─ ① LLM推理: streamingHelper.streamCall(model, prompt, convId)
+     *     │    System 消息 = systemPrompt + 8条硬性规则（不要解释、直接行动、等待审批就停...）
+     *     │    User 消息 = 运行时上下文 + working context + 计划全貌(✓/→/○) + 最近结果 + 当前步骤指令
+     *     │    工具列表 = toolSet.callbacks()（所有可用工具的 schema）
+     *     │    产出: AssistantMessage（可能含工具调用请求）
+     *     │
+     *     ├─ LLM 没请求工具 → finalResult = result.text(); break;  ← 步骤完成
+     *     │
+     *     ├─ LLM 请求工具 → ② 工具执行: ToolExecutionExecutor.execute()
+     *     │    正常路径: 并行执行所有 tool calls → 工具响应 → 下一轮
+     *     │    审批重放: 注入 PRE_APPROVED_TOOL_CALL → 匹配工具名 → executePreApproved → 跳过 ToolGuard
+     *     │    审批触发: need_approval 工具 → approvalTriggered=true → break
+     *     │    returnDirect: 工具标记 returnDirect → stepDirectOutputs 非空 → break
+     *     │
+     *     └─ ③ 观察: 工具输出追加入 messages → toolCallCount++ → 下一轮 while
+     *
+     * 输出（四种路径）：
+     *
+     *   (1) 审批暂停: currentPhase="awaiting_approval", currentStepIndex 不递增
+     *       → StepProgressDispatcher → END（图暂停）
+     *       → 用户确认 → Controller 调 chatWithReplayStream → 重新进入本节点
+     *
+     *   (2) returnDirect 短路: currentPhase="plan_aborted", FINAL_SUMMARY 已设置, currentStepIndex=steps.size()
+     *       → StepProgressDispatcher → END（跳过后续步骤，不调 PlanSummaryNode）
+     *
+     *   (3) 步骤异常: currentPhase="plan_aborted", planningService.markPlanFailed
+     *       → StepProgressDispatcher → END（计划终止）
+     *
+     *   (4) 步骤完成: currentPhase="step_completed", currentStepIndex+1, WORKING_CONTEXT 增量更新
+     *       → StepProgressDispatcher(currentStepIndex < steps.size ? 循环 : 汇总)
+     *       → PlanSummaryNode 汇总输出
+     */
     @Override
     @SuppressWarnings("unchecked")
     public Map<String, Object> apply(OverAllState state) throws Exception {
@@ -509,6 +567,10 @@ public class StepExecutionNode implements NodeAction {
         return sb.toString();
     }
 
+    /**
+     * ★ 构建 Prompt（5层消息）：System(增强规则) → Skill → 运行时上下文 → Working Context → 计划上下文+当前步骤。
+     * 每次进入步骤时调用，产出完整的消息列表传给 streamingHelper.streamCall()。
+     */
     private List<Message> buildStepMessages(PlanStateAccessor accessor, String step, String systemPrompt, String workspaceBasePath) {
         List<Message> messages = new ArrayList<>();
 

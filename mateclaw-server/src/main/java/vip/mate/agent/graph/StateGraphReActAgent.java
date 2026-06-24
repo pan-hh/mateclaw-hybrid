@@ -27,23 +27,34 @@ import java.util.concurrent.atomic.AtomicReference;
 import static vip.mate.agent.graph.state.MateClawStateKeys.*;
 
 /**
- * 基于 StateGraph v2 的 ReAct Agent
- * <p>
- * 使用 spring-ai-alibaba-graph-core 的 StateGraph 引擎，
- * 实现显式可控的 Thought → Action → Observation 循环，
- * 含 Summarizing、LimitExceeded 和 FinalAnswer 节点。
- * <p>
- * 关键特性：
- * - 迭代次数强制控制（maxIterations 真正生效）
- * - ToolGuard 安全拦截（在 ActionNode 中执行）
- * - 工具调用过程可观测
- * - Summarizing 阶段收束冗长上下文
- * - 超限友好提示
- * - 结构化生命周期日志
- * <p>
- * content_delta 和 thinking_delta 由节点内 {@link NodeStreamingChatHelper} 直推，
- * chatStructuredStream() 只处理 phase/tool/事件等结构化事件。
- * 不再从 NodeOutput 二次整段下发已流式推送的内容。
+ * ============================================================
+ * 【调用链路第5步】基于 StateGraph v2 的 ReAct Agent — 主执行体
+ * ============================================================
+ * 角色：整个 Agent 系统的核心执行器，包含：
+ * 1. buildInitialState() — 构建图的初始状态（注入历史、prompt、迭代上限等）
+ * 2. chatStructuredStream() — 流式执行入口，驱动 compiledGraph.stream()
+ * 3. 流式结果处理 — 提取 content/thinking/tool events 并通过 StreamDelta 流出
+ *
+ * ReAct 循环流程（由 StateGraph 引擎驱动）：
+ *   START
+ *     ↓
+ *   [ReasoningNode]  ← 调用 LLM 推理，判断是否需要工具
+ *     ↓ (ReasoningDispatcher 路由)
+ *     ├─→ [ActionNode]       执行工具调用
+ *     │     ↓
+ *     │   [ObservationNode]  处理结果、递增迭代计数
+ *     │     ↓ (ObservationDispatcher 路由)
+ *     │     ├─→ [ReasoningNode]   继续循环
+ *     │     ├─→ [SummarizingNode] 压缩上下文
+ *     │     ├─→ [LimitExceededNode] 超限
+ *     │     └─→ [FinalAnswerNode]  审批等待→直接回答
+ *     ├─→ [SummarizingNode] 上下文过长 → Reasoning
+ *     ├─→ [FinalAnswerNode] 直接回答 / 错误兜底
+ *     └─→ [LimitExceededNode] 迭代超限 → FinalAnswer
+ *   [FinalAnswerNode] → (goal?) → [GoalEvaluationNode] → END
+ *
+ * 一个完整的 ReAct 迭代 = Reasoning → Action → Observation
+ * 迭代上限 = maxIterations（默认150，硬顶150）
  *
  * @author MateClaw Team
  */
@@ -316,6 +327,18 @@ public class StateGraphReActAgent extends BaseAgent implements StructuredStreamC
         return chatStructuredStream(userMessage, conversationId, "");
     }
 
+    /**
+     * 【核心执行方法】结构化流式对话
+     *
+     * 执行流程：
+     * 1. buildInitialState() → 构建图初始状态（历史、prompt、迭代上限等）
+     * 2. compiledGraph.stream(inputs, config) → 启动 StateGraph 流式执行
+     * 3. 对每个 NodeOutput 提取：
+     *    - events（工具开始/结束、阶段切换、迭代信息）
+     *    - content/thinking（已由 NodeStreamingChatHelper 广播过，这里标记 persistOnly）
+     *    - token usage（累计 prompt/completion tokens）
+     * 4. 流结束后追加 _usage_final 事件（最终 token 统计）
+     */
     @Override
     public Flux<AgentService.StreamDelta> chatStructuredStream(String userMessage, String conversationId,
                                                                 String requesterId) {
@@ -323,8 +346,10 @@ public class StateGraphReActAgent extends BaseAgent implements StructuredStreamC
         try {
             log.info("[{}] StateGraph structured stream: conversationId={}", agentName, conversationId);
 
+            // 步骤1：构建初始状态 Map
             Map<String, Object> inputs = buildInitialState(userMessage, conversationId);
             inputs.put(REQUESTER_ID, requesterId != null ? requesterId : "");
+            // 每次调用独立 threadId，确保图状态不会跨调用泄漏
             String threadId = UUID.randomUUID().toString();
             RunnableConfig config = RunnableConfig.builder().threadId(threadId).build();
 
@@ -464,8 +489,18 @@ public class StateGraphReActAgent extends BaseAgent implements StructuredStreamC
         }
     }
 
+    /**
+     * 【初始状态构建】在图执行前，将 Agent 的配置、历史、约束打包成 StateGraph 的输入。
+     *
+     * 主要工作：
+     * 1. 加载对话历史 → buildConversationHistory()（包含窗口裁剪、压缩边界处理）
+     * 2. 上下文窗口管理 → fitToWindow()（防止超出模型 context window）
+     * 3. 构建当前用户消息 → 支持多模态附件注入
+     * 4. 设置迭代上限 → 深度思考模式 +5 步余量
+     * 5. 初始化所有状态键 → USER_MESSAGE, MESSAGES, MAX_ITERATIONS, etc.
+     */
     private Map<String, Object> buildInitialState(String userMessage, String conversationId) {
-        // 加载会话历史
+        // ===== 阶段1：加载并裁剪对话历史 =====
         List<Message> historyMessages = buildConversationHistory(conversationId, userMessage);
 
         // 上下文窗口管理：裁剪超出模型 context window 的历史（含当前消息预算）
@@ -484,23 +519,25 @@ public class StateGraphReActAgent extends BaseAgent implements StructuredStreamC
                     workspaceBasePath);
         }
 
+        // ===== 阶段2：组装消息列表（历史 + 当前用户消息）=====
         List<Message> messages = new ArrayList<>(historyMessages);
         // 构建当前用户消息：支持 multimodal（如果有图片附件，直接注入 Media）
-        // 同步获取 routing decision，写入 state 供后续节点 / accumulator 读取。
         BaseAgent.CurrentTurnUserMessage currentTurn = buildCurrentUserMessageWithRouting(conversationId, userMessage);
         messages.add(currentTurn.userMessage());
 
+        // ===== 阶段3：初始状态 Map（传递给 StateGraph 引擎）=====
         Map<String, Object> inputs = new HashMap<>();
-        // 输入
+        // --- 输入字段 ---
         inputs.put(USER_MESSAGE, userMessage);
         inputs.put(CONVERSATION_ID, conversationId);
         inputs.put(AGENT_ID, agentId != null ? agentId : "");
         inputs.put(WORKSPACE_BASE_PATH, workspaceBasePath != null ? workspaceBasePath : "");
         inputs.put(SYSTEM_PROMPT, systemPrompt != null ? systemPrompt : "你是一个有帮助的AI助手。");
         inputs.put(MESSAGES, messages);
-        // 迭代控制：深度思考模式允许更多迭代（思考需要更多轮工具调用）
-        // maxIterations<=0 表示软上限解除（由 LLM 自己决定何时收尾），加分要短路，
-        // 否则 thinking-on 会把"无限"误算成 5（变成"5 步就停"）。
+
+        // --- 迭代控制 ---
+        // 深度思考模式允许更多迭代（思考需要更多轮工具调用）
+        // maxIterations<=0 表示软上限解除（由 LLM 自己决定何时收尾）
         String thinkingLevel = vip.mate.llm.chatmodel.ThinkingLevelHolder.get();
         boolean thinkingOn = thinkingLevel != null && !"off".equalsIgnoreCase(thinkingLevel);
         int effectiveMaxIterations = (maxIterations <= 0)

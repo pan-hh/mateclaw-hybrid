@@ -236,29 +236,56 @@ public class ConversationWindowManager {
      * callers should always pass the path so historical spill files stay
      * grouped with the workspace that produced them.
      */
+    /**
+     * 【上下文窗口管理主入口】将多轮会话历史裁剪到模型上下文窗口以内。
+     *
+     * <h3>预算计算逻辑</h3>
+     * <pre>
+     *   模型最大输入 token（effectiveMax，默认 128000）
+     *   触发阈值 = effectiveMax × compactTriggerRatio（默认 75%）
+     *
+     *   总 token = system提示词 + 当前用户消息 + 历史消息 + 工具schema
+     *   历史可用预算 = effectiveMax - 预留 token（system + 当前消息 + 工具schema + 5%安全余量）
+     *
+     *   如果总 token ≤ 触发阈值 → 不压缩，直接返回
+     *   如果总 token > 触发阈值 → 进入四阶段压缩（compactMessages）
+     * </pre>
+     *
+     * <h3>安全封顶</h3>
+     * 对于小窗口模型（Ollama 16K、本地 8K），system 提示词 + 当前消息
+     * 可能就接近甚至超过 effectiveMax 的 50%。此时如果不封顶，
+     * historyBudget 会变成负数 → 压缩目标比压缩前还大 → 死循环。
+     */
     public List<Message> fitToWindow(List<Message> messages, String systemPrompt,
                                      String currentUserMessage,
                                      Integer maxInputTokens, ChatModel chatModel,
                                      String conversationId, Long agentId,
                                      java.util.Collection<ToolCallback> toolCallbacks,
                                      String workspaceBasePath) {
+        // ==== 第0步：前置检查 ====
         if (messages == null || messages.isEmpty()) {
             return messages;
         }
+        // 记录溢出计数起点，用于后续统计本次压缩触发了多少次磁盘溢写
         long spillsAtEntry = (toolResultStorage != null) ? toolResultStorage.getSpillCount() : 0L;
 
+        // ==== 第0.5步：预清理 — 去重旧工具结果、溢写超大结果到磁盘 ====
         messages = pruneOldToolResultsForModelInput(messages, conversationId, workspaceBasePath);
 
+        // ==== 第1步：计算有效 token 上限和触发阈值 ====
         int effectiveMax = (maxInputTokens != null && maxInputTokens > 0)
                 ? maxInputTokens : properties.getDefaultMaxInputTokens();
         int triggerThreshold = (int) (effectiveMax * properties.getCompactTriggerRatio());
 
+        // ==== 第2步：分段估算当前 token 使用量 ====
+        // system提示词、当前用户消息、完整历史、所有工具的函数定义schema
         int systemTokens = TokenEstimator.estimateTokens(systemPrompt);
         int currentMsgTokens = TokenEstimator.estimateTokens(currentUserMessage) + TokenEstimator.PER_MESSAGE_OVERHEAD;
         int historyTokens = TokenEstimator.estimateTokens(messages);
         int toolsTokens = TokenEstimator.estimateToolsTokens(toolCallbacks);
         int totalTokens = systemTokens + currentMsgTokens + historyTokens + toolsTokens;
 
+        // ==== 第3步：未超阈值 → 无需压缩 ====
         if (totalTokens <= triggerThreshold) {
             return messages;
         }
@@ -267,25 +294,28 @@ public class ConversationWindowManager {
                 totalTokens, systemTokens, currentMsgTokens, historyTokens, toolsTokens,
                 triggerThreshold, effectiveMax, conversationId);
 
+        // ==== 第4步：清理过期缓存和冷却记录 ====
         evictExpiredEntries();
 
-        // 可用于历史的 token 预算 = max - system - currentMsg - tools - 安全余量
+        // ==== 第5步：计算历史消息可用预算 ====
+        // 预留 token = 必须保留的（system + 当前消息 + 工具schema）+ 5%安全余量
         int reservedTokens = systemTokens + currentMsgTokens + toolsTokens + (int) (effectiveMax * 0.05);
-        // 预留 reserve 硬封顶到 effectiveMax 的 50%。
-        // 小上下文模型（Ollama 16K、本地 8K）下，systemTokens + currentMsgTokens 很容易
-        // 接近或超过 effectiveMax，不封顶会让 historyBudget 变负数导致死循环压缩
-        // （压缩目标比压缩前还大 → 压缩后又触发压缩）。
+        // ⚠️ 硬封顶：小上下文模型下 system+工具schema 就占了大量 token，
+        //    预留太多会导致 historyBudget 变负数 → 压缩死循环
         int reservedCap = Math.max(1024, effectiveMax / 2);
         if (reservedTokens > reservedCap) {
             log.warn("[ConversationWindow] 预留 token {} 超过上下文窗口 50% {}，封顶至 {}",
                     reservedTokens, effectiveMax, reservedCap);
             reservedTokens = reservedCap;
         }
+        // 历史消息可用预算 = 总窗口 - 不可压缩的预留部分
         int historyBudget = effectiveMax - reservedTokens;
 
-        // 尾部保护 token 预算：阈值的 20%
+        // ==== 第6步：计算尾部保护预算 ====
+        // 尾部保护：阈值的 20%，确保最近的对话轮次有足够的 token 空间
         int tailTokenBudget = (int) (triggerThreshold * 0.20);
 
+        // ==== 第7步：进入四阶段压缩 ====
         return compactMessages(messages, historyBudget, tailTokenBudget, chatModel,
                 conversationId, agentId, totalTokens, spillsAtEntry, "token_threshold");
     }
@@ -319,37 +349,64 @@ public class ConversationWindowManager {
         }
     }
 
+    /**
+     * 【四阶段压缩核心】将消息列表拆分为"旧消息"和"近期消息"两部分，
+     * 对旧消息应用逐级增强的压缩策略，直到满足历史 token 预算。
+     *
+     * <h3>压缩流程</h3>
+     * <pre>
+     *   Phase 0: 拆分 — 基于 token 预算计算尾部边界（findTailBoundary）
+     *           + Pair Safety 调整（enforcePairSafeBoundary）
+     *             → oldMessages（待压缩） + recentMessages（保留尾部）
+     *
+     *   Phase 1: Soft Trim     → 工具结果做 head+tail 截断（保留首尾）
+     *            若仍超预算 ↓
+     *   Phase 2: Hard Clear    → 工具结果替换为 "[tool result removed]"
+     *            若仍超预算 ↓
+     *   Phase 2.5: Memory钩子  → 让 MemoryProvider 在压缩前提取关键信息
+     *            若仍超预算 ↓
+     *   Phase 3: LLM 摘要      → 调用专用 LLM 生成结构化摘要
+     *                            （Goal/Progress/Decisions/Files/NextSteps）
+     *                            支持迭代更新模式
+     *
+     *   组装结果: [摘要, Anchor(原始目标), ...recentMessages]
+     *   若摘要失败 → 降级保留最近 4 条旧消息
+     * </pre>
+     *
+     * @return 压缩后的消息列表（摘要 + anchor + 近期消息）
+     */
     private List<Message> compactMessages(List<Message> messages, int historyBudget,
                                           int tailTokenBudget, ChatModel chatModel,
                                           String conversationId, Long agentId,
                                           int preTokens, long spillsAtEntry,
                                           String trigger) {
+        // 向前端广播压缩开始事件
         broadcastCompactStatus(conversationId, "start", Map.of(
                 "preTokens", preTokens,
                 "messagesIn", messages.size(),
                 "trigger", trigger
         ));
 
-        // 动态计算尾部保护边界（替代固定 preserveRecentPairs）
-        int headEnd = 0; // 头部保护：暂不保护（system prompt 已在外部计算）
+        // ==== Phase 0: 基于 token 预算动态计算尾部保护边界 ====
+        // 替代旧的固定 preserveRecentPairs 配置，改为按 token 预算从后往前累加
+        int headEnd = 0;
         int tailStart = findTailBoundary(messages, headEnd, tailTokenBudget);
 
         if (tailStart <= headEnd) {
+            // 消息数不足以拆分 → 无可压缩
             log.debug("[ConversationWindow] 消息数不足以拆分，跳过压缩");
             broadcastCompactStatus(conversationId, "skipped",
                     Map.of("reason", "insufficient_messages"));
             return messages;
         }
 
-        // Pair safety: never split an AssistantMessage's tool_calls from its
-        // matching ToolResponseMessages. The cut may walk forward (i.e. the
-        // tail grows) until every call/response cluster lives on one side of
-        // the boundary. If no safe cut survives the walk, skip compaction —
-        // a broken pair would 400 every OpenAI-compatible provider, which is
-        // strictly worse than letting context cross the budget by one extra
-        // turn.
+        // ==== Phase 0: Pair Safety 边界调整 ====
+        // 核心安全约束：永远不能把 AssistantMessage 的 tool_calls 和
+        // 对应的 ToolResponseMessage 分到 oldMessages 和 recentMessages 两边。
+        // 拆分 tool pair 会导致所有 OpenAI 兼容的 provider 返回 HTTP 400。
         int pairSafeCut = enforcePairSafeBoundary(messages, headEnd, tailStart);
         if (pairSafeCut <= headEnd) {
+            // 找不到安全的切割点 → 跳过本轮压缩（宁可多占一点 token）
             broadcastCompactStatus(conversationId, "skipped",
                     Map.of("reason", "pair_boundary_collapsed"));
             return messages;
@@ -360,23 +417,31 @@ public class ConversationWindowManager {
         }
         tailStart = pairSafeCut;
 
+        // 拆分消息列表：oldMessages（待压缩） + recentMessages（保留的尾部）
         List<Message> oldMessages = new ArrayList<>(messages.subList(headEnd, tailStart));
         List<Message> recentMessages = messages.subList(tailStart, messages.size());
 
-        // ═══ Phase 1: Soft Trim — 裁剪旧工具结果 ═══
+        // ═══════════════════════════════════════════════════════════════
+        // Phase 1: Soft Trim — 对旧工具结果做 head+tail 截断，保留首尾各200字符
+        // 目标：温和压缩，大部分信息仍然可见
+        // ═══════════════════════════════════════════════════════════════
         int softTrimmed = softTrimToolResults(oldMessages);
         if (softTrimmed > 0) {
             int afterTrimTokens = TokenEstimator.estimateTokens(oldMessages) + TokenEstimator.estimateTokens(recentMessages);
             log.info("[ConversationWindow] Phase 1 Soft trim: {} tool results trimmed, tokens={}, budget={}",
                     softTrimmed, afterTrimTokens, historyBudget);
             if (afterTrimTokens <= historyBudget) {
+                // 软裁剪后满足预算 → 完成
                 List<Message> result = new ArrayList<>(oldMessages);
                 result.addAll(recentMessages);
                 return result;
             }
         }
 
-        // ═══ Phase 2: Hard Clear — 替换所有旧工具结果为占位符 ═══
+        // ═══════════════════════════════════════════════════════════════
+        // Phase 2: Hard Clear — 所有旧工具结果替换为占位符
+        // 目标：激进压缩，只保留 "工具 X 被执行过" 的语义
+        // ═══════════════════════════════════════════════════════════════
         int hardCleared = hardClearToolResults(oldMessages);
         if (hardCleared > 0) {
             int afterClearTokens = TokenEstimator.estimateTokens(oldMessages) + TokenEstimator.estimateTokens(recentMessages);
@@ -389,7 +454,10 @@ public class ConversationWindowManager {
             }
         }
 
-        // ═══ Phase 2.5: MemoryProvider 钩子 — 压缩前提取关键信息 ═══
+        // ═══════════════════════════════════════════════════════════════
+        // Phase 2.5: MemoryProvider 钩子 — 压缩前让记忆系统提取关键信息
+        // 例如：从对话历史中提取用户偏好、项目决策等持久化信息
+        // ═══════════════════════════════════════════════════════════════
         String memoryExtraContext = "";
         if (agentId != null && memoryManager != null) {
             try {
@@ -403,16 +471,22 @@ public class ConversationWindowManager {
             }
         }
 
-        // ═══ Phase 3: Pre-Prune + LLM 结构化摘要 ═══
+        // ═══════════════════════════════════════════════════════════════
+        // Phase 3: LLM 结构化摘要 — 终极压缩手段
+        // 1. 先 Pre-prune：把给摘要 LLM 看的工具输出也清理掉（减少输入 token）
+        // 2. 计算动态摘要预算（被压缩内容的 20%，500-3000 字）
+        // 3. 检查缓存（相同 conversationId + 消息数的摘要可复用）
+        // 4. 调用摘要 LLM（结构化模板：Goal/Progress/Decisions/Files/NextSteps）
+        // ═══════════════════════════════════════════════════════════════
 
-        // Pre-prune：在喂给摘要 LLM 前清理旧消息中的工具输出
+        // Pre-prune：清理摘要 LLM 输入中的工具输出，减少摘要调用本身的 token 消耗
         List<Message> forSummary = new ArrayList<>(oldMessages);
         int prePruned = prePruneForSummary(forSummary);
         if (prePruned > 0) {
             log.info("[ConversationWindow] Phase 3 Pre-prune: {} tool results cleared before summarization", prePruned);
         }
 
-        // 计算动态摘要预算
+        // 动态摘要预算：被压缩内容 token × 20%，上下限由配置控制
         int summaryBudget = computeSummaryBudget(forSummary);
 
         broadcastCompactStatus(conversationId, "summarize", Map.of(
@@ -420,7 +494,8 @@ public class ConversationWindowManager {
                 "summaryBudget", summaryBudget
         ));
 
-        // 检查缓存
+        // 摘要缓存：key = conversationId + 被压缩消息数
+        // 同一轮对话的同一批消息 → 已缓存摘要 → 跳过 LLM 调用
         String cacheKey = conversationId + ":" + oldMessages.size();
         CachedSummary cached = summaryCache.get(cacheKey);
         String summary;
@@ -431,6 +506,7 @@ public class ConversationWindowManager {
             fromCache = true;
             log.debug("[ConversationWindow] 命中摘要缓存, conv={}", conversationId);
         } else {
+            // 未命中缓存 → 调用摘要 LLM（含冷却检查）
             summary = generateSummary(forSummary, chatModel, conversationId, summaryBudget, memoryExtraContext);
             if (summary != null) {
                 summaryCache.put(cacheKey, new CachedSummary(summary, System.currentTimeMillis()));
@@ -440,22 +516,24 @@ public class ConversationWindowManager {
             }
         }
 
-        // 组装结果
+        // ═══════════════════════════════════════════════════════════════
+        // 组装最终结果
+        // ═══════════════════════════════════════════════════════════════
         List<Message> result = new ArrayList<>();
         boolean anchored = false;
         if (summary != null && !summary.isBlank()) {
+            // 摘要作为 UserMessage 注入（非 SystemMessage）避免权限升级
             result.add(new UserMessage(SUMMARY_PREFIX + summary));
 
-            // Anchor the original user goal so a long task that paged through
-            // dozens of turns can still see what was originally asked. Always
-            // as a UserMessage — promoting historical user input to a
-            // SystemMessage would be a privilege-escalation risk.
+            // 嵌入原始用户目标（Anchor）：长任务可能在几十轮后忘记
+            // 最初被问的是什么，Anchor 让模型始终能看到最初的问题
             Message anchor = buildFirstUserAnchor(oldMessages);
             if (anchor != null) {
                 result.add(anchor);
                 anchored = true;
             }
         } else if (!oldMessages.isEmpty()) {
+            // 摘要失败降级：只保留最近 4 条旧消息
             log.warn("[ConversationWindow] 摘要生成失败，降级为保留最近 4 条旧消息, conv={}", conversationId);
             int fallbackKeep = Math.min(4, oldMessages.size());
             result.addAll(oldMessages.subList(oldMessages.size() - fallbackKeep, oldMessages.size()));
@@ -464,9 +542,12 @@ public class ConversationWindowManager {
                     "fallbackKept", fallbackKeep
             ));
         }
+        // 尾部近期消息原样保留
         result.addAll(recentMessages);
 
-        // 压缩后校验
+        // ═══════════════════════════════════════════════════════════════
+        // 压缩后校验：如果结果仍然超过预算，执行二次裁剪（从前往后丢弃）
+        // ═══════════════════════════════════════════════════════════════
         int resultTokens = TokenEstimator.estimateTokens(result);
         if (resultTokens > historyBudget && result.size() > 2) {
             log.warn("[ConversationWindow] 压缩后仍超预算: {} > {}, 执行二次裁剪", resultTokens, historyBudget);
@@ -474,9 +555,7 @@ public class ConversationWindowManager {
             resultTokens = TokenEstimator.estimateTokens(result);
         }
 
-        // Persist the boundary + announce completion only when the summary
-        // actually wrote a row. Failed-summary fallback already broadcast
-        // its own event above.
+        // 持久化压缩边界记录（用于前端展示"上下文已压缩"卡片）
         if (summary != null && !summary.isBlank() && conversationService != null && !fromCache) {
             long spillsThisTurn = (toolResultStorage != null)
                     ? Math.max(0L, toolResultStorage.getSpillCount() - spillsAtEntry)
@@ -498,14 +577,11 @@ public class ConversationWindowManager {
                 log.warn("[ConversationWindow] Failed to persist compression boundary: {}", e.getMessage());
             }
             if (summaryId != null) {
-                // Mirror the DB row's metadata: the SSE consumer needs the id
-                // to deep-link the boundary card without having to refetch.
                 boundaryMetadata.put("summaryId", summaryId);
             }
             broadcastCompactStatus(conversationId, "done", boundaryMetadata);
         } else if (summary != null && !summary.isBlank() && fromCache) {
-            // Cached summary path — no new DB row, but emit done so the
-            // frontend status bar still updates.
+            // 缓存命中路径：不发 DB 行，但仍通知前端状态更新
             broadcastCompactStatus(conversationId, "done", Map.of(
                     "preTokens", preTokens,
                     "postTokens", resultTokens,
@@ -521,24 +597,38 @@ public class ConversationWindowManager {
     // ==================== 动态 Token 预算 ====================
 
     /**
-     * 基于 token 预算动态计算尾部保护边界（替代固定 preserveRecentPairs）。
-     * 从消息列表末尾向前累加 token，直到耗尽预算或达到最小消息数。
+     * 【动态尾部边界计算】替代固定的 preserveRecentPairs 配置。
+     *
+     * <h3>算法</h3>
+     * 从消息列表末尾向前累加每条消息的 token 估算值，直到：
+     * <ol>
+     *   <li>累加的 token 超过软上限（tailTokenBudget × 1.5），且</li>
+     *   <li>已保留的消息数 ≥ 最小尾部消息数（minTail）</li>
+     * </ol>
+     *
+     * <h3>与旧配置的兼容</h3>
+     * 如果 protectLastMinMessages 未配置但 preserveRecentPairs 有值，
+     * 则使用 pairs×2 作为 minTail（每对 = user+assistant = 2条消息）。
+     *
+     * @return 切割索引：消息在这个索引及之后的保留在尾部
      */
     private int findTailBoundary(List<Message> messages, int headEnd, int tailTokenBudget) {
         int n = messages.size();
         if (n <= headEnd + 1) return headEnd;
 
+        // 最小尾部消息数：优先用新配置，兼容旧配置
         int minTail = Math.min(properties.getProtectLastMinMessages(), n - headEnd - 1);
-        // 兼容旧配置：如果 protectLastMinMessages 未设置但 preserveRecentPairs 有值
         int pairsBased = properties.getPreserveRecentPairs() * 2;
         if (pairsBased > minTail) {
             minTail = Math.min(pairsBased, n - headEnd - 1);
         }
 
+        // 软上限：允许超出 token 预算 50%，避免因一条大消息而丢弃所有尾部
         int softCeiling = (int) (tailTokenBudget * 1.5);
         int accumulated = 0;
         int cutIdx = n;
 
+        // 从后往前扫描：累加 token，直到超过软上限且已满足最小消息数
         for (int i = n - 1; i >= headEnd; i--) {
             int msgTokens = TokenEstimator.estimateTokens(messages.get(i));
             if (accumulated + msgTokens > softCeiling && (n - i) >= minTail) {
@@ -548,7 +638,7 @@ public class ConversationWindowManager {
             cutIdx = i;
         }
 
-        // 确保至少保留 minTail 条
+        // 兜底：至少保留 minTail 条消息
         int fallbackCut = n - minTail;
         if (cutIdx > fallbackCut) {
             cutIdx = fallbackCut;
@@ -776,35 +866,28 @@ public class ConversationWindowManager {
     }
 
     /**
-     * Walk the messages newest-to-oldest, keeping the latest tool response
-     * verbatim and applying space-saving rewrites to older ones:
+     * 【预清理：旧工具结果优化】在压缩/发送给模型之前，对工具结果做无损或低损优化。
      *
+     * <h3>处理策略（从最新到最旧扫描）：</h3>
      * <ol>
-     *   <li>Bodies already starting with {@link ToolResultStorage#SPILL_MARKER_PREFIX}
-     *       were spilled at tool-execution time — pass through untouched.</li>
-     *   <li>If a body matches an identical body already seen in a newer turn,
-     *       replace it with a short "duplicate tool output omitted" placeholder
-     *       (only above {@link #DEDUP_MIN_CHARS} so we don't bloat tiny acks).</li>
-     *   <li>Otherwise, when a {@link ToolResultStorage} is wired and a
-     *       conversation id is available, try
-     *       {@link ToolResultStorage#persistIfOversized} to spill the raw
-     *       bytes to disk and replace the inline body with a preview + path
-     *       so the model can read_file the original on demand.</li>
-     *   <li>If none of the above apply, leave the body verbatim. Bodies
-     *       under the spill threshold or running without a storage hook are
-     *       preserved exactly — the lossy "summarized for model context"
-     *       single-liner that used to fire here destroyed enough context
-     *       on long tasks to be the wrong default.</li>
+     *   <li><b>Pass Through</b> — 以下情况原样保留：
+     *     <ul>
+     *       <li>已溢写到磁盘的（带有 SPILL_MARKER_PREFIX 前缀）</li>
+     *       <li>最新的那条工具响应（模型正在推理的）</li>
+     *       <li>豁免工具（delegateToAgent/delegateParallel，子Agent不可重放）</li>
+     *       <li>空内容</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>去重</b> — 与更新的轮次中内容完全相同的 → 替换为 "duplicate tool output omitted"</li>
+     *   <li><b>溢写到磁盘</b> — 超大结果（超出阈值）→ 写入磁盘文件，
+     *     上下文内只保留预览 + 文件路径，模型可通过 read_file 按需恢复完整内容</li>
+     *   <li><b>保留原样</b> — 不满足以上条件的，宁可多传几个 token 也不错删</li>
      * </ol>
      *
-     * <p>The {@link #PRUNE_EXEMPT_TOOLS} set still bypasses everything:
-     * sub-agent delegations are not replayable, so their full transcript
-     * stays in context.
-     *
-     * @param messages          full conversation in chronological order
-     * @param conversationId    used to scope spill files; {@code null} disables spill
-     * @param workspaceBasePath used to locate the spill directory; {@code null}
-     *                          falls back through the storage's resolveBaseDir chain
+     * <h3>设计原则</h3>
+     * 早期版本对所有旧工具结果做"一刀切"的损失性摘要，在实际使用中破坏了
+     * 长任务的上下文连贯性。现在的策略是：优先无损优化（去重、溢写），
+     * 只在确实需要时才进入 S1-S3 的损失性压缩。
      */
     public List<Message> pruneOldToolResultsForModelInput(List<Message> messages,
                                                           String conversationId,

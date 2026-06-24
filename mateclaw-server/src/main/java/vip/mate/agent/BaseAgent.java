@@ -36,8 +36,19 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Agent 抽象基类
- * 定义所有 Agent 的基础行为与状态管理
+ * ============================================================
+ * 【调用链路第4步之B】Agent 抽象基类 — 所有 Agent 的公共基础设施
+ * ============================================================
+ * 角色：定义 Agent 的核心能力，包括：
+ * 1. 状态管理（AtomicReference&lt;AgentState&gt;，线程安全）
+ * 2. 对话历史构建（buildConversationHistory / sanitizeForLlm）
+ * 3. 多模态消息处理（图片/视频注入 LLM prompt）
+ * 4. 上下文窗口管理（窗口裁剪、压缩边界检测）
+ * 5. 工具调用重放（工具交换结果还原）
+ *
+ * 子类：
+ *  - StateGraphReActAgent: ReAct 模式（思考→行动→观察循环）
+ *  - StateGraphPlanExecuteAgent: Plan-Execute 模式（先规划再执行）
  *
  * @author MateClaw Team
  */

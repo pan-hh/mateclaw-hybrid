@@ -35,8 +35,20 @@ public final class TokenEstimator {
     }
 
     /**
-     * 估算文本 token 数。
-     * CJK 字符按 1:1，ASCII 按 4:1，其他 Unicode 按 1.5:1。
+     * 估算文本 token 数（按字符类型分类估算）。
+     *
+     * <h3>估算比例</h3>
+     * <ul>
+     *   <li>CJK（中日韩）字符 → 1 字符 ≈ 1 token</li>
+     *   <li>ASCII（英文、数字、符号）→ 4 字符 ≈ 1 token</li>
+     *   <li>其他 Unicode → 1.5 字符 ≈ 1 token（取整策略：×2÷3）</li>
+     * </ul>
+     *
+     * <h3>为什么是"保守偏高"估算？</h3>
+     * 对于纯英文文本（平均 3-4 字符/token），4:1 的估计偏高 25%-33%。
+     * 这是故意的：偏高估计意味着压缩阈值触发得更早，比真实 token 先触发，
+     * 从而避免"估算偏低 → 阈值触发过晚 → 请求实际发出 → 模型返回 400"的故障。
+     * 牺牲一点上下文空间换取安全保证。
      */
     public static int estimateTokens(String text) {
         if (text == null || text.isEmpty()) {
@@ -45,6 +57,7 @@ public final class TokenEstimator {
         int cjkChars = 0;
         int asciiChars = 0;
         int otherChars = 0;
+        // 逐字符分类统计
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
             if (isCJK(c)) {
@@ -55,7 +68,7 @@ public final class TokenEstimator {
                 otherChars++;
             }
         }
-        // CJK: 1 char ≈ 1 token; ASCII: 4 chars ≈ 1 token; Other: 1.5 chars ≈ 1 token
+        // 三元估值：CJK 1:1, ASCII 4:1(+3凑整), Other 2:3(+2补整)
         return cjkChars + (asciiChars + 3) / 4 + (otherChars * 2 + 2) / 3;
     }
 
@@ -82,14 +95,18 @@ public final class TokenEstimator {
     }
 
     /**
-     * Estimate the token cost of the tool definitions sent on every LLM call
-     * (name + description + JSON inputSchema, plus per-tool wrapper overhead).
-     * <p>
-     * A heavily-bound agent (multiple MCP servers, many built-ins) can carry
-     * several thousand tokens of tool schema on every request — leaving them
-     * out of the context-window budget makes compression decisions fire too
-     * late and on small models triggers HTTP 400 once the request actually
-     * goes out.
+     * 估算所有工具函数定义的 token 成本。
+     *
+     * <h3>为什么必须纳入上下文窗口预算？</h3>
+     * 工具的函数定义（name + description + JSON inputSchema）会在每次 LLM
+     * 调用时随请求一起发送。一个绑定了多个 MCP 服务器的 Agent 可能携带
+     * 数千 token 的工具 schema。如果不把工具 schema 纳入预算计算，
+     * 压缩决策会低估实际请求大小，在小窗口模型上会触发 HTTP 400。
+     *
+     * <h3>预算公式</h3>
+     * 每个工具: estimateTokens(name) + estimateTokens(description) +
+     *          estimateTokens(inputSchema) + PER_TOOL_OVERHEAD(12)
+     * PER_TOOL_OVERHEAD 覆盖 JSON 包装开销: {"type":"function","function":{"name":"...","parameters":{...}}}
      */
     public static int estimateToolsTokens(Collection<ToolCallback> callbacks) {
         if (callbacks == null || callbacks.isEmpty()) {

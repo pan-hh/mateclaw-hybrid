@@ -17,12 +17,20 @@ import java.util.stream.Collectors;
 import static vip.mate.agent.graph.state.MateClawStateKeys.*;
 
 /**
- * 观察节点（ReAct Observation 阶段）
- * <p>
- * 处理工具执行结果，通过 {@link ObservationProcessor} 进行标准化和截断，
- * 递增迭代计数器，并判断是否需要进入 summarizing 阶段。
- * <p>
- * 这是 maxIterations 强制执行的核心节点之一，配合 ObservationDispatcher 实现迭代控制。
+ * ============================================================
+ * 【ReAct 第3阶段：Observation】观察节点 — 处理工具结果+迭代控制
+ * ============================================================
+ * 角色：每次工具执行后的"检查站"，负责：
+ * 1. 处理工具结果 → ObservationProcessor 标准化/截断长结果
+ * 2. 递增迭代计数器 → currentIteration + 1
+ * 3. 预算压力预警 → 在 70%/90% 迭代消耗时注入提示给 LLM
+ * 4. 重复观测检测 → 连续3次相同结果则强制终止
+ * 5. 判断是否需要上下文压缩 → 设置 shouldSummarize
+ *
+ * 配合 ObservationDispatcher 实现迭代控制：
+ *  - 超限 → LimitExceededNode
+ *  - 需要总结 → SummarizingNode
+ *  - 否则 → ReasoningNode（继续下一轮循环）
  *
  * @author MateClaw Team
  */

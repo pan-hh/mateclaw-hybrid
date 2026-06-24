@@ -8,19 +8,20 @@ import vip.mate.agent.graph.state.MateClawStateAccessor;
 import static vip.mate.agent.graph.state.MateClawStateKeys.*;
 
 /**
- * 推理路由（分支优先级）
- * <ol>
- *   <li>迭代超限 → limitExceededNode</li>
- *   <li>可直接回答（含 fatal error 自带的错误文案） → finalAnswerNode</li>
- *   <li>LLM 调用次数超限 → limitExceededNode（仅拦截继续循环的路径）</li>
- *   <li>需要工具调用 → actionNode</li>
- *   <li>需要总结压缩 → summarizingNode</li>
- *   <li>兜底 → finalAnswerNode</li>
- * </ol>
- * <p>
- * 注意：ReasoningNode 的 fatal error 路径会自行设置 finalAnswer（错误文案）+
- * finishReason(ERROR_FALLBACK)，因此会命中分支 2 直接走 finalAnswerNode，
- * 不需要也不应该路由到 LimitExceededNode（后者会再发一次 LLM 调用）。
+ * ============================================================
+ * 【ReAct 路由1】ReasoningDispatcher — 推理节点后的分支决策
+ * ============================================================
+ * 在 ReasoningNode 完成 LLM 调用后，根据结果决定下一步走向。
+ *
+ * 分支优先级（按顺序检查，命中即返回）：
+ * 1. 迭代超限？         → LimitExceededNode（强制终止循环）
+ * 2. 可直接回答？       → FinalAnswerNode（LLM 直接给出了答案）
+ * 3. LLM 调用次数超限？→ LimitExceededNode（安全兜底）
+ * 4. 需要工具调用？     → ActionNode（进入工具执行阶段）
+ * 5. 需要总结压缩？     → SummarizingNode（上下文过长，先压缩再继续）
+ * 6. 兜底              → FinalAnswerNode
+ *
+ * 这是整个 ReAct 循环中最重要的路由决策点。
  *
  * @author MateClaw Team
  */

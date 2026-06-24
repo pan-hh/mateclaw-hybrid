@@ -35,8 +35,119 @@ public class MemoryRecallService {
 
     private static final int MAX_QUERY_HASHES = 32;
 
+    // Chunk 级召回：用 "chunk:" 前缀区分，metadata（pageId/filename/chunkId）序列化到 snippetPreview
+    private static final String CHUNK_PREFIX = "chunk:";
+
     /**
-     * 记录一次文件召回
+     * 记录一次 Chunk 级召回。
+     * <p>
+     * 将召回频率统计从文件级别细化到 Chunk 级别，实现更精准的长期记忆形成。
+     * filename 使用 {@code "chunk:" + chunkId} 格式，原始文件信息编码到 snippetPreview 中。
+     *
+     * @param agentId        Agent ID
+     * @param chunkId        Chunk ID（唯一标识）
+     * @param contentPreview 内容预览（截取前 200 字符）
+     * @param userQueryHash  查询哈希（用于多样性计算）
+     * @param pageId         关联页面 ID（可选）
+     * @param originalFilename 原始文件名（可选）
+     */
+    public void recordChunkRecall(Long agentId, Long chunkId, String contentPreview,
+                                  String userQueryHash, Long pageId, String originalFilename) {
+        if (agentId == null || chunkId == null) {
+            return;
+        }
+
+        String preview = contentPreview != null && contentPreview.length() > 200
+                ? contentPreview.substring(0, 200)
+                : contentPreview;
+
+        // 构建 metadata JSON 存储到 snippetPreview 中（前 150 字符给 preview，后 50 给 JSON 元数据尾缀）
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("chunkId", chunkId);
+        if (pageId != null) meta.put("pageId", pageId);
+        if (originalFilename != null && !originalFilename.isEmpty()) meta.put("filename", originalFilename);
+        String metaJson = toJson(meta);
+
+        // 将 metadata 嵌入 snippetPreview（用 || 分隔，方便 computeScores 解析）
+        String enrichedPreview = (preview != null ? preview : "") + "||" + metaJson;
+        // 确保不超出数据库字段长度（TEXT 字段很大，但合规防截断）
+        if (enrichedPreview.length() > 2048) {
+            enrichedPreview = enrichedPreview.substring(0, 2048);
+        }
+
+        String uniqueKey = CHUNK_PREFIX + chunkId;
+        LocalDateTime now = LocalDateTime.now();
+
+        MemoryRecallEntity existing = recallMapper.selectOne(
+                new LambdaQueryWrapper<MemoryRecallEntity>()
+                        .eq(MemoryRecallEntity::getAgentId, agentId)
+                        .eq(MemoryRecallEntity::getFilename, uniqueKey)
+                        .eq(MemoryRecallEntity::getDeleted, 0)
+                        .last("LIMIT 1"));
+
+        if (existing != null) {
+            existing.setRecallCount(existing.getRecallCount() + 1);
+            existing.setDailyCount(existing.getDailyCount() + 1);
+            existing.setLastRecalledAt(now);
+            existing.setSnippetPreview(enrichedPreview);
+
+            if (userQueryHash != null) {
+                List<String> hashes = parseQueryHashes(existing.getQueryHashes());
+                if (!hashes.contains(userQueryHash) && hashes.size() < MAX_QUERY_HASHES) {
+                    hashes.add(userQueryHash);
+                }
+                existing.setQueryHashes(toJson(hashes));
+            }
+
+            recallMapper.updateById(existing);
+        } else {
+            try {
+                MemoryRecallEntity entity = new MemoryRecallEntity();
+                entity.setAgentId(agentId);
+                entity.setFilename(uniqueKey);
+                entity.setSnippetPreview(enrichedPreview);
+                entity.setRecallCount(1);
+                entity.setDailyCount(1);
+                entity.setLastRecalledAt(now);
+                entity.setPromoted(false);
+                entity.setScore(0.0);
+                entity.setCreateTime(now);
+                entity.setUpdateTime(now);
+                entity.setDeleted(0);
+
+                if (userQueryHash != null) {
+                    entity.setQueryHashes(toJson(List.of(userQueryHash)));
+                }
+
+                recallMapper.insert(entity);
+            } catch (org.springframework.dao.DuplicateKeyException e) {
+                log.debug("[MemoryRecall] Concurrent chunk insert for {}, falling back to update", uniqueKey);
+                MemoryRecallEntity retry = recallMapper.selectOne(
+                        new LambdaQueryWrapper<MemoryRecallEntity>()
+                                .eq(MemoryRecallEntity::getAgentId, agentId)
+                                .eq(MemoryRecallEntity::getFilename, uniqueKey)
+                                .eq(MemoryRecallEntity::getDeleted, 0)
+                                .last("LIMIT 1"));
+                if (retry != null) {
+                    retry.setRecallCount(retry.getRecallCount() + 1);
+                    retry.setDailyCount(retry.getDailyCount() + 1);
+                    retry.setLastRecalledAt(now);
+                    retry.setSnippetPreview(enrichedPreview);
+                    if (userQueryHash != null) {
+                        List<String> hashes = parseQueryHashes(retry.getQueryHashes());
+                        if (!hashes.contains(userQueryHash) && hashes.size() < MAX_QUERY_HASHES) {
+                            hashes.add(userQueryHash);
+                        }
+                        retry.setQueryHashes(toJson(hashes));
+                    }
+                    recallMapper.updateById(retry);
+                }
+            }
+        }
+    }
+
+    /**
+     * 记录一次文件召回（原始方法）
      */
     public void recordRecall(Long agentId, String filename, String snippetText, String userQueryHash) {
         if (agentId == null || filename == null || filename.isBlank()) {
@@ -224,6 +335,116 @@ public class MemoryRecallService {
                 .filter(e -> e.getScore() >= threshold)
                 .sorted(Comparator.comparingDouble(MemoryRecallEntity::getScore).reversed())
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * 计算 Chunk 级别加权评分（含文件级聚合）。
+     * <p>
+     * 包装 {@link #computeScores(Long)}，额外对 Chunk 级召回
+     * （filename 以 "chunk:" 开头）按原始文件分组聚合：
+     * <ul>
+     *   <li>同一文件的 Chunk 取平均分作为文件级得分</li>
+     *   <li>最高分 Chunk 作为代表（保留其 snippetPreview）</li>
+     * </ul>
+     * 聚合后的文件级实体替换原始 Chunk 实体返回。
+     *
+     * @param agentId Agent ID
+     * @return 包含文件级聚合的高分候选列表
+     */
+    public List<MemoryRecallEntity> computeScoresWithChunkAggregation(Long agentId) {
+        List<MemoryRecallEntity> candidates = computeScores(agentId);
+        if (candidates.isEmpty()) {
+            return candidates;
+        }
+
+        // 分离 Chunk 级和普通文件级
+        List<MemoryRecallEntity> chunkEntries = candidates.stream()
+                .filter(e -> e.getFilename() != null && e.getFilename().startsWith(CHUNK_PREFIX))
+                .collect(Collectors.toList());
+        List<MemoryRecallEntity> fileEntries = candidates.stream()
+                .filter(e -> e.getFilename() == null || !e.getFilename().startsWith(CHUNK_PREFIX))
+                .collect(Collectors.toList());
+
+        if (chunkEntries.isEmpty()) {
+            return candidates;
+        }
+
+        // 按原始文件名分组（从 snippetPreview 的 "||" 分隔符后解析 metadata JSON）
+        Map<String, List<MemoryRecallEntity>> groupedByFile = new LinkedHashMap<>();
+        for (MemoryRecallEntity chunk : chunkEntries) {
+            String originalFile = extractOriginalFilename(chunk.getSnippetPreview());
+            String groupKey = originalFile != null ? originalFile : chunk.getFilename();
+            groupedByFile.computeIfAbsent(groupKey, k -> new ArrayList<>()).add(chunk);
+        }
+
+        // 对每个分组聚合为文件级实体
+        List<MemoryRecallEntity> aggregated = new ArrayList<>();
+        double threshold = properties.getEmergenceScoreThreshold();
+
+        for (var entry : groupedByFile.entrySet()) {
+            List<MemoryRecallEntity> chunks = entry.getValue();
+
+            // 平均分
+            double avgScore = chunks.stream()
+                    .mapToDouble(MemoryRecallEntity::getScore)
+                    .average().orElse(0);
+
+            // 总召回次数（取和）
+            int totalRecalls = chunks.stream()
+                    .mapToInt(MemoryRecallEntity::getRecallCount)
+                    .sum();
+
+            // 最高分 Chunk 作为代表
+            MemoryRecallEntity topChunk = chunks.stream()
+                    .max(Comparator.comparingDouble(MemoryRecallEntity::getScore))
+                    .orElse(null);
+
+            if (topChunk != null && avgScore >= threshold) {
+                MemoryRecallEntity fileLevel = new MemoryRecallEntity();
+                fileLevel.setId(topChunk.getId());
+                fileLevel.setAgentId(agentId);
+                fileLevel.setFilename(entry.getKey()); // 原始文件名
+                fileLevel.setScore(avgScore);
+                fileLevel.setRecallCount(totalRecalls);
+                fileLevel.setDailyCount(chunks.stream()
+                        .mapToInt(MemoryRecallEntity::getDailyCount).sum());
+                fileLevel.setLastRecalledAt(topChunk.getLastRecalledAt());
+                fileLevel.setSnippetPreview(topChunk.getSnippetPreview());
+                fileLevel.setPromoted(false);
+                aggregated.add(fileLevel);
+            }
+        }
+
+        // 合并：文件级聚合 + 原有的非 Chunk 文件级实体
+        List<MemoryRecallEntity> result = new ArrayList<>(aggregated);
+        result.addAll(fileEntries.stream()
+                .filter(e -> e.getScore() >= threshold)
+                .toList());
+        result.sort(Comparator.comparingDouble(MemoryRecallEntity::getScore).reversed());
+
+        log.info("[MemoryRecall] Chunk aggregation: {} chunk entries → {} file-level aggregates + {} file entries → {} total",
+                chunkEntries.size(), aggregated.size(), fileEntries.size(), result.size());
+
+        return result;
+    }
+
+    /**
+     * 从 snippetPreview 中提取原始文件名。
+     * snippetPreview 格式：{@code "preview text||{\"filename\":\"xxx.md\",...}"}
+     */
+    private String extractOriginalFilename(String snippetPreview) {
+        if (snippetPreview == null) return null;
+        int sep = snippetPreview.indexOf("||");
+        if (sep < 0 || sep + 2 >= snippetPreview.length()) return null;
+        String metaPart = snippetPreview.substring(sep + 2).trim();
+        if (metaPart.isEmpty() || !metaPart.startsWith("{")) return null;
+        try {
+            Map<String, Object> meta = objectMapper.readValue(metaPart, new TypeReference<>() {});
+            Object fn = meta.get("filename");
+            return fn != null ? fn.toString() : null;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     /**

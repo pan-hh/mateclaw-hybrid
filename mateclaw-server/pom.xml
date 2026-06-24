@@ -395,6 +395,22 @@
             <groupId>io.pebbletemplates</groupId>
             <artifactId>pebble</artifactId>
         </dependency>
+
+        <!-- ===== Elasticsearch Java Client (full-text search) ===== -->
+        <dependency>
+            <groupId>co.elastic.clients</groupId>
+            <artifactId>elasticsearch-java</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.elasticsearch.client</groupId>
+            <artifactId>elasticsearch-rest-client</artifactId>
+        </dependency>
+
+        <!-- ===== Milvus Vector Database SDK (vector search) ===== -->
+        <dependency>
+            <groupId>io.milvus</groupId>
+            <artifactId>milvus-sdk-java</artifactId>
+        </dependency>
     </dependencies>
 
     <build>

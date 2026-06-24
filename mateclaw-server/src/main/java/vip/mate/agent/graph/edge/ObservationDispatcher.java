@@ -8,16 +8,21 @@ import vip.mate.agent.graph.state.MateClawStateAccessor;
 import static vip.mate.agent.graph.state.MateClawStateKeys.*;
 
 /**
- * 观察路由（3 路分支，迭代控制核心）
- * <p>
- * 决定 ReAct 循环在 Observation 后的走向：
- * <ol>
- *   <li>迭代超限 → limitExceededNode（强制终止）</li>
- *   <li>需要总结 → summarizingNode（观察够多/结果太长）</li>
- *   <li>继续循环 → reasoningNode</li>
- * </ol>
- * <p>
- * 这是 maxIterations 字段的核心执行点。
+ * ============================================================
+ * 【ReAct 路由2】ObservationDispatcher — 迭代控制的核心执行点
+ * ============================================================
+ * 在 ObservationNode 处理完工具结果后，决定下一步走向。
+ *
+ * 分支优先级：
+ * 0. 审批等待？         → FinalAnswerNode（图暂停，等待用户审批后重放）
+ * 0b. returnDirect？    → FinalAnswerNode（跳过后续 LLM 调用，直接用工具结果回答）
+ * 1. 迭代超限？         → LimitExceededNode（currentIteration >= maxIterations → 强制终止）
+ * 2. 有错误？           → LimitExceededNode
+ * 3. 需要总结？         → SummarizingNode（观察历史太长需要压缩）
+ * 4. 否则               → ReasoningNode（继续下一轮 ReAct 循环）
+ *
+ * 这是 maxIterations 的核心执行点 — 每次观察后都检查迭代上限，
+ * 确保 Agent 不会无限循环。
  *
  * @author MateClaw Team
  */

@@ -9,14 +9,26 @@ import vip.mate.agent.graph.state.MateClawStateKeys;
 import java.util.List;
 
 /**
- * 步骤进度分发器
- * <p>
- * 根据 current_phase 和 current_step_index / plan_steps 判断路由：
- * <ul>
- *   <li>current_phase == "awaiting_approval" → END（暂停图执行，等待用户审批后 replay）</li>
- *   <li>当前步骤索引 &lt; 步骤总数 → 继续执行下一步（STEP_EXECUTION_NODE）</li>
- *   <li>所有步骤完成 → 路由到汇总节点（PLAN_SUMMARY_NODE）</li>
- * </ul>
+ * ============================================================
+ * 【Plan-Execute 第2个路由】StepProgressDispatcher — 步骤完成后的三路分支
+ * ============================================================
+ * 在 StepExecutionNode 完成一个步骤后，根据 current_phase 和 current_step_index
+ * 决定下一步走向。这是 Plan-Execute 循环控制的核心路由点。
+ *
+ * 三路分支（按优先级）：
+ * 1. current_phase == "awaiting_approval" → END
+ *    工具审批暂停 — 图暂停，等用户确认后通过 replay 重新执行
+ * 2. current_phase == "plan_aborted" → END
+ *    计划异常中止（returnDirect 短路 / 步骤执行异常）— 图终止
+ * 3. current_step_index >= plan_steps.size() → PLAN_SUMMARY_NODE
+ *    所有步骤已完成 — 进入汇总阶段
+ * 4. 否则 → STEP_EXECUTION_NODE
+ *    还有步骤未完成 — 继续执行下一步（循环回自身）
+ *
+ * 与 ReAct 的 ObservationDispatcher 对比：
+ *  - ObservationDispatcher 多了"迭代超限 → LimitExceededNode"分支
+ *  - StepProgressDispatcher 没有超限 — 步骤数量固定，由规划决定
+ *  - 两者都有审批暂停处理（awaiting_approval → END）
  *
  * @author MateClaw Team
  */
@@ -25,7 +37,9 @@ public class StepProgressDispatcher implements EdgeAction {
     @Override
     @SuppressWarnings("unchecked")
     public String apply(OverAllState state) {
-        // 审批暂停态或步骤执行失败中止态：直接结束当前图 tick
+        // ★ 审批暂停 or 计划中止 → 直接结束图 tick
+        //    awaiting_approval: 工具需要审批，等 replay 重新注入 PRE_APPROVED_TOOL_CALL
+        //    plan_aborted: returnDirect 短路 or 步骤异常 → 计划终止
         String currentPhase = state.value(MateClawStateKeys.CURRENT_PHASE, "");
         if ("awaiting_approval".equals(currentPhase) || "plan_aborted".equals(currentPhase)) {
             return StateGraph.END;

@@ -5,18 +5,25 @@ import com.alibaba.cloud.ai.graph.action.EdgeAction;
 import vip.mate.agent.graph.plan.state.PlanStateKeys;
 
 /**
- * Routes the graph after the triage node.
- * <ul>
- *   <li>{@code needs_planning=false} → {@code DIRECT_ANSWER_NODE} (direct answer, no tools)</li>
- *   <li>{@code needs_planning=true} → {@code STEP_EXECUTION_NODE} (single- or multi-step plan)</li>
- * </ul>
- * <p>
- * If the triage key is absent, we default to {@code direct_answer} — an unset
- * {@code needs_planning} means triage did not run to completion, and Occam's
- * razor says treat it as "no planning" rather than auto-splitting a task the
- * system never classified. The previous default ({@code true}) biased every
- * unresolved request into a multi-step plan, which was the main source of the
- * "every request splits into subtasks" behavior (see RFC-008).
+ * ============================================================
+ * 【Plan-Execute 第1个路由】PlanGenerationDispatcher — 规划后的两路分支
+ * ============================================================
+ * 在 PlanGenerationNode 完成分流后，根据 NEEDS_PLANNING 决定走向：
+ *
+ * - needs_planning = false → DIRECT_ANSWER_NODE（简单问答，直接回答后结束）
+ * - needs_planning = true  → STEP_EXECUTION_NODE（进入逐步执行流程）
+ *
+ * 默认策略（needs_planning 未设置时）：
+ *   默认为 false → 走直接回答路径。
+ *   原因：未设置意味着分流没跑完，保守起见不应该把未分类的请求
+ *         强推进多步计划（之前默认 true 导致"每个请求都被拆成多步"的问题，
+ *         参见 RFC-008）。
+ *
+ * 与 ReAct 的 ReasoningDispatcher 对比：
+ *   ReAct 有6个分支（工具调用/总结/直接回答/超限...），
+ *   PlanExecute 只有2个分支，更简洁 — 复杂度的处理完全交给 StepExecutionNode
+ *
+ * @author MateClaw Team
  */
 public class PlanGenerationDispatcher implements EdgeAction {
 

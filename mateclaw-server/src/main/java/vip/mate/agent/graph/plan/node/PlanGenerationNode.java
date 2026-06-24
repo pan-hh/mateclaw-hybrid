@@ -26,23 +26,41 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * Task triage node for the Plan-Execute graph.
- * <p>
- * Decides one of three routes for the user's goal and emits a JSON directive:
- * <ul>
- *   <li>{@code direct_answer} — pure knowledge question, no tools, no planning</li>
- *   <li>single-step plan — needs tools but a single coherent action (steps=1)</li>
- *   <li>multi-step plan — genuinely independent subtasks (2–6 steps)</li>
- * </ul>
- * When {@code needs_planning} is false the node streams the direct answer
- * through {@link NodeStreamingChatHelper} and the graph exits via
- * {@code DirectAnswerNode}. Otherwise a plan is persisted via
- * {@link PlanningService} and {@code step_execution} takes over.
- * <p>
- * The previous version forced {@code needs_planning=true} whenever any tool
- * was required, producing multi-step plans for trivial single-hop tasks.
- * The revised prompt collapses single-hop tool use into a 1-step plan so the
- * executor can handle it with one ReAct-style iteration (see RFC-008).
+ * ============================================================
+ * 【Plan-Execute 第1阶段：Triage】任务分流 + 规划生成节点
+ * ============================================================
+ * 这是 Plan-Execute 流程的第一个节点（所有请求必经之路），负责将用户请求
+ * 分到三条执行路径之一：
+ *
+ *   (A) 直接回答: needs_planning=false → DirectAnswerNode → END
+ *       纯知识问答，不需要工具，LLM 直接生成回答
+ *
+ *   (B) 单步任务: needs_planning=true, steps=[一条指令] → StepExecutionNode
+ *       需要工具但本质是一个连贯动作，执行器内部迭代调用工具（不提前拆分为多步）
+ *
+ *   (C) 多步任务: needs_planning=true, steps=[2~6条] → StepExecutionNode（循环）
+ *       多个明显独立的子任务，逐步执行 → 汇总
+ *
+ * 核心 Prompt 设计（PLANNING_PROMPT）：
+ * - 角色定义："你是任务分流器，不是聊天助手"
+ * - 输出格式：结构化 JSON（needs_planning, direct_answer, steps）
+ * - 关键原则：单工具调用不拆成多步、默认不读取 MEMORY.md
+ * - 工具公示：告知 LLM 可用工具名称，帮助判断类别
+ *
+ * 为什么不用 agent 的 systemPrompt 做分流？
+ * - agent 的 systemPrompt 包含 wiki、skill 指南、记忆等，会稀释分流指令
+ * - 分流只需要判断"是否需要工具、是否需要拆解步骤"，不需要全部上下文
+ *
+ * 降级策略：
+ * - LLM 返回异常 → fallback 为单步计划（保证工具可用，不降级为空文本）
+ * - 返回 needs_planning=true 但 steps 为空 → 以用户目标作为单步指令兜底
+ * - 持久化失败 → 最终降级为 direct_answer 错误提示
+ *
+ * 审批重放路径（Replay）：
+ * - 如果 state 中已有 PLAN_ID（由 chatWithReplayStream 注入），跳过 LLM 分流
+ * - 直接复用已存在的计划，从暂停步骤继续执行
+ *
+ * @author MateClaw Team
  */
 @Slf4j
 public class PlanGenerationNode implements NodeAction {
@@ -115,17 +133,44 @@ public class PlanGenerationNode implements NodeAction {
         this(chatModel, planningService, null, null, null);
     }
 
+    /**
+     * ★ Plan-Execute 图的第一站 — 所有请求必经此门。
+     *
+     * 输入（从 OverAllState 读取）：
+     *   GOAL — 用户原始请求，buildInitialState 注入
+     *   WORKING_CONTEXT — 对话历史压缩摘要，buildInitialState 或上一步 StepExecutionNode 写入
+     *   SYSTEM_PROMPT — Agent 的系统提示词
+     *   GOAL_FOLLOWUP_PROMPT — GoalEvaluationNode 回传的跟进提示（重新规划时才有）
+     *   PLAN_ID — 审批重放时由 chatWithReplayStream 注入（有则跳过 LLM 分流）
+     *
+     * 内部处理三步走：
+     *   ① Goal 跟进注入：如果有 followupPrompt，追加到 goal 尾部（原目标 + 评估建议）
+     *   ② 审批重放检查：如果 state 已有 PLAN_ID → 跳过 LLM，直接复用已有计划返回 needsPlanning(true)
+     *   ③ LLM 分流：构建5条消息的 Prompt → streamCallSilent 调 LLM → 解析 TriageResult → 三种输出
+     *
+     * 输出及后续流转：
+     *   (A) needsPlanning=false  → DIRECT_ANSWER, phase="direct_answer"
+     *       → PlanGenerationDispatcher → DirectAnswerNode
+     *       → DirectAnswerNode 搬运 DIRECT_ANSWER → FINAL_SUMMARY → (goal?) GoalEvaluation → END
+     *
+     *   (B/C) needsPlanning=true → PLAN_ID, PLAN_STEPS, phase="plan_generated"
+     *       → PlanGenerationDispatcher → StepExecutionNode（进入逐步执行，内部 while 循环）
+     *       → 完成 → StepProgressDispatcher → PlanSummaryNode（汇总）
+     *
+     * 异常处理（降级链）：
+     *   LLM 异常 → fallback 单步 plan(goal, [goal]) → 持久化失败 → direct_answer 错误提示
+     */
     @Override
     public Map<String, Object> apply(OverAllState state) throws Exception {
         PlanStateAccessor accessor = new PlanStateAccessor(state);
         String goal = accessor.goal();
 
-        // Goal follow-up injection: GoalEvaluationNode requested a re-plan
-        // pass with extra guidance. The mid-pass plan state was wiped by
-        // the previous node, so we run the normal planning flow but
-        // append the follow-up prompt to the user goal so the planner
-        // sees "do these original objectives + this next step the
-        // evaluator just asked for".
+        // ★ Goal 跟进注入：
+        //    上游: GoalEvaluationNode 评估后认为目标未完成 → 设置 GOAL_FOLLOWUP_PROMPT
+        //          并以 followup 路由回本节点（PlanGenerationNode）
+        //    此时步骤状态已被 GoalEvaluationNode 清除，所以重新走分流流程
+        //    原目标 + "Follow-up guidance" = 原始目标 + 评估器的建议作为下一轮目标
+        //    后续: goal 被传给 LLM 做分流 → 新一轮的 PlanGeneration → StepExecution
         String followupPrompt = state.value(MateClawStateKeys.GOAL_FOLLOWUP_PROMPT, "");
         if (!followupPrompt.isEmpty()) {
             log.info("[PlanGeneration] Goal follow-up active, augmenting goal with {} chars of guidance",
@@ -142,7 +187,9 @@ public class PlanGenerationNode implements NodeAction {
         List<GraphEventPublisher.GraphEvent> events = new ArrayList<>();
         events.add(GraphEventPublisher.phase("planning", Map.of("goal", goal)));
 
-        // Replay path: plan is already in state (injected by chatWithReplayStream); skip LLM.
+        // ---- 分支0：审批重放 — state 中已有 PLAN_ID，跳过 LLM 分流 ----
+        // 来源: chatWithReplayStream 提前注入 PLAN_ID + PLAN_STEPS + CURRENT_STEP_INDEX 到 state
+        // 后续: PlanGenerationDispatcher(needsPlanning=true) → StepExecutionNode，从 resumeIndex 继续
         Long existingPlanId = state.<Long>value(PlanStateKeys.PLAN_ID).orElse(null);
         if (existingPlanId != null) {
             List<String> existingSteps = accessor.planSteps();
@@ -153,16 +200,23 @@ public class PlanGenerationNode implements NodeAction {
                     .planId(existingPlanId)
                     .planSteps(existingSteps)
                     .planValid(true)
-                    .currentStepIndex(resumeIndex)
+                    .currentStepIndex(resumeIndex)     // 从暂停的步骤继续
                     .currentPhase("plan_generated")
                     .events(events)
                     .build();
         }
 
         try {
-            // PLANNING_PROMPT is the sole system message; we deliberately do NOT
-            // concatenate the agent's full systemPrompt (wiki / skill / memory guidance),
-            // which would dilute the triage instructions.
+            // ---- 构建分流 Prompt（5层消息结构，不含 agent 的 systemPrompt）----
+            // L1. System — 分流器角色定义 + 分类规则（PLANNING_PROMPT）
+            // L2. User  — 运行时上下文（当前时间、工作目录、渠道/发起者）
+            //     ↳ RuntimeContextInjector.buildContextMessage(workspaceBasePath, null, chatOrigin)
+            // L3. User  — 可用工具列表（"可用工具：search, file, browser..."）
+            //     ↳ 让 LLM 知道有什么工具可用，从而判断类别：无工具→简单问答，单工具→单步，多工具/独立→多步
+            // L4. User  — Working Context（对话历史压缩摘要）
+            //     ↳ 让分流感知用户此前提过的要求（"用中文回复"、"格式要求"等）
+            // L5. User  — 用户目标 + JSON schema 提示（BeanOutputConverter.getFormat()）
+            //     ↳ 告诉 LLM 输出格式：{"needs_planning": bool, "direct_answer": "...", "steps": [...]}
             List<Message> promptMessages = new ArrayList<>();
             promptMessages.add(new SystemMessage(PLANNING_PROMPT));
             String workspaceBasePath = state.value(MateClawStateKeys.WORKSPACE_BASE_PATH, "");
@@ -244,7 +298,13 @@ public class PlanGenerationNode implements NodeAction {
             boolean needsPlanning = triage != null && triage.needsPlanning();
 
             if (!needsPlanning) {
-                // Category (A): direct answer — push to client and terminate via DirectAnswerNode.
+                // ---- 类别 (A) 直接回答：纯知识问答，无需工具 ----
+                // 输出: NEEDS_PLANNING=false, DIRECT_ANSWER, CONTENT_STREAMED=true
+                // 后续: PlanGenerationDispatcher(false) → DirectAnswerNode
+                //       → DirectAnswerNode 搬运 DIRECT_ANSWER → FINAL_SUMMARY
+                //       → (有 active goal?) → GoalEvaluationNode → END
+                // 注意: broadcastContent 已将答案直推 SSE，FINAL_SUMMARY 由 executeStream
+                //       标记 persistOnly 做 DB 持久化（防止 SSE 重复推送）
                 String directAnswer = triage != null && triage.directAnswer() != null
                         ? triage.directAnswer() : llmResponse;
                 log.info("[PlanGeneration] Direct-answer route taken (no tools, no planning)");
@@ -255,24 +315,26 @@ public class PlanGenerationNode implements NodeAction {
                         .needsPlanning(false)
                         .directAnswer(directAnswer)
                         .currentPhase("direct_answer")
-                        .contentStreamed(true)
+                        .contentStreamed(true)       // ← executeStream 据此标记 persistOnly
                         .thinkingStreamed(!result.thinking().isEmpty())
                         .mergeUsage(state, result)
                         .events(events)
                         .build();
             }
 
-            // Categories (B) single-step or (C) multi-step: extract steps.
+            // ---- 类别 (B) 单步 or (C) 多步：提取步骤列表 ----
+            // 输出: NEEDS_PLANNING=true, PLAN_ID, PLAN_STEPS, CURRENT_STEP_INDEX=0
+            // 后续: PlanGenerationDispatcher(true) → StepExecutionNode（逐步执行）
             List<String> steps = triage != null ? triage.steps() : null;
             if (steps == null || steps.isEmpty()) {
-                // LLM asked for planning but produced no steps — fall back to a
-                // synthetic 1-step plan using the user's goal so the executor
-                // can still reach the tools. (Previous behavior dropped back to
-                // direct_answer, which silently stripped tool capability.)
+                // LLM 判定 needsPlanning=true 但没给步骤 → 用用户目标兜底为单步计划
+                // 之前的做法是降级为 direct_answer，但那样会丢失工具调用能力
                 log.warn("[PlanGeneration] needs_planning=true with empty steps; falling back to single-step plan");
                 steps = List.of(goal);
             }
 
+            // ★ 持久化计划到 DB（mate_plan 表 + mate_plan_step 子表）
+            //    planningService.createPlan 返回的 PlanEntity 包含自动生成的 id
             var plan = planningService.createPlan(agentId, goal, steps);
             log.info("[PlanGeneration] Plan created: id={}, steps={} ({})",
                     plan.getId(), steps.size(), steps.size() == 1 ? "single-step" : "multi-step");
@@ -281,11 +343,11 @@ public class PlanGenerationNode implements NodeAction {
 
             return PlanStateAccessor.output()
                     .needsPlanning(true)
-                    .planId(plan.getId())
-                    .planSteps(steps)
+                    .planId(plan.getId())             // → StepExecutionNode 用此 id 更新 DB
+                    .planSteps(steps)                  // → StepExecutionNode 遍历 steps
                     .planValid(true)
-                    .currentStepIndex(0)
-                    .currentPhase("plan_generated")
+                    .currentStepIndex(0)               // → StepExecutionNode 从第0步开始
+                    .currentPhase("plan_generated")    // → 前端状态栏展示
                     .contentStreamed(true)
                     .thinkingStreamed(!result.thinking().isEmpty())
                     .mergeUsage(state, result)

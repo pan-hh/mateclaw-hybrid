@@ -19,11 +19,23 @@ import java.util.concurrent.CancellationException;
 import static vip.mate.agent.graph.state.MateClawStateKeys.*;
 
 /**
- * 工具执行节点（ReAct Action 阶段）
- * <p>
- * 委托 {@link ToolExecutionExecutor} 执行工具调用，支持并发执行和审批 barrier。
- * <p>
- * 支持 forced_replay 阶段：当审批通过后的重放调用到达时，跳过 ToolGuard 检查直接执行。
+ * ============================================================
+ * 【ReAct 第2阶段：Action】工具执行节点 — 执行 LLM 请求的工具调用
+ * ============================================================
+ * 角色：接收 ReasoningNode 产出的 TOOL_CALLS，委托 ToolExecutionExecutor 执行。
+ *
+ * 执行流程：
+ * 1. 从 state 读取 TOOL_CALLS（上一轮 ReasoningNode 产出的工具调用列表）
+ * 2. 委托 ToolExecutionExecutor.execute() 执行
+ *    - 顺序阶段：ToolGuard 安全检查（拒绝危险操作）
+ *    - 分段并发：可并行工具并发执行，有依赖关系的顺序执行
+ *    - 审批 barrier：需要审批的工具暂停，等待用户确认
+ * 3. 构建 ToolResponseMessage 写入 MESSAGES（APPEND策略）
+ *
+ * 特殊路径：
+ * - returnDirect（RFC-052）：工具标记了 returnDirect=true → 跳过后续 LLM 调用，直接输出
+ * - forced_replay：审批通过后的重放，跳过 ToolGuard 检查
+ * - load_skill/enable_tool：记录已加载的技能/扩展工具，供下轮推理使用
  *
  * @author MateClaw Team
  */

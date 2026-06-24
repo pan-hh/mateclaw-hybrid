@@ -1,7 +1,14 @@
 package vip.mate.agent;
 
 /**
- * Agent 运行状态枚举
+ * ============================================================
+ * 【调用链路第4步之A】Agent 运行状态枚举
+ * ============================================================
+ * 定义了 Agent 的生命周期状态机：
+ *   IDLE → RUNNING/PLANNING/EXECUTING → DONE/FAILED/ERROR
+ * 或 IDLE → RUNNING → WAITING_USER_INPUT（审批等待）
+ *
+ * 状态转换由 BaseAgent.setState() 管理，用 AtomicReference 保证线程安全
  *
  * @author MateClaw Team
  */
@@ -19,7 +26,7 @@ public enum AgentState {
     /** 运行中（ReAct / PlanExecute 使用） */
     RUNNING,
 
-    /** 等待用户输入 */
+    /** 等待用户输入（如审批确认） */
     WAITING_USER_INPUT,
 
     /** 已完成 */

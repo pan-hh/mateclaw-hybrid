@@ -7,33 +7,26 @@ import vip.mate.agent.graph.plan.state.PlanStateKeys;
 import java.util.Map;
 
 /**
- * 直接回答节点
- * <p>
- * When PlanGenerationNode classifies the user's message as a simple
- * question, this node propagates {@code direct_answer} into
- * {@code FINAL_SUMMARY} so the graph terminates with the answer in the
- * canonical place every downstream consumer reads from.
- * <p>
- * Earlier versions skipped writing FINAL_SUMMARY when
- * {@code CONTENT_STREAMED=true}, on the theory that broadcastContent had
- * already pushed the text and a second copy in FINAL_SUMMARY would cause
- * double persistence. That was wrong: broadcastContent goes directly to
- * the SSE side-channel via {@code streamTracker.broadcastDelta} and does
- * NOT participate in the DB segment that ChatController accumulates from
- * the structured stream. Skipping FINAL_SUMMARY left
- * {@code AgentService.chat()} (the sync entry used by every IM channel)
- * with an empty reply, which silently dropped DingTalk / Slack /
- * Telegram replies on the direct-answer path. It also left
- * {@code mate_message.content} empty on the web channel — the SSE
- * client saw the answer in real time but reopening the conversation
- * showed a blank assistant turn.
- * <p>
- * Re-broadcast suppression is the responsibility of the stream layer,
- * not this node:
- * {@link vip.mate.agent.graph.plan.StateGraphPlanExecuteAgent#chatStructuredStream}
- * tags the FINAL_SUMMARY delta as {@code persistOnly} when
- * CONTENT_STREAMED is true, and {@code ChatController} respects that flag
- * to persist without re-pushing.
+ * ============================================================
+ * 【Plan-Execute 快速出口】直接回答节点 — 搬运 DIRECT_ANSWER → FINAL_SUMMARY
+ * ============================================================
+ *
+ * 角色：PlanGenerationNode 判定为类别(A)直接回答时，由 PlanGenerationDispatcher 路由到此节点。
+ * 本节点只做一件事: 读取 DIRECT_ANSWER，写入 FINAL_SUMMARY，图即可终止。
+ *
+ * 为什么需要独立节点（而不是在 PlanGenerationNode 直接写 FINAL_SUMMARY）？
+ * 1. 【架构一致性】所有终止路径统一通过 FINAL_SUMMARY 输出，ChatController 只看这个键
+ * 2. 【Goal 评估链路】即使简单问答也可能属于 active goal，需要经过 GoalEvaluationNode 评估进度。
+ *    DirectAnswerNode → (active goal && !evaluated?) → GoalEvaluationNode → END
+ *    如果 PlanGenerationNode 直接写 FINAL_SUMMARY 并加 END 边，Goal 评估就无法触发
+ * 3. 【流式防重】DIRECT_ANSWER 已通过 broadcastContent 推 SSE，
+ *    executeStream 将 FINAL_SUMMARY 标记 persistOnly 做 DB 持久化不重复推送
+ *
+ * 数据流:
+ *   上游: PlanGenerationNode → DIRECT_ANSWER + PlanGenerationDispatcher(false)
+ *   本节点: DIRECT_ANSWER → FINAL_SUMMARY
+ *   下游: executeStream → StreamDelta → ChatController → mate_message(DB+IM)
+ *   路由: (active goal && !evaluated?) → GoalEvaluationNode → END
  *
  * @author MateClaw Team
  */

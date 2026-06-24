@@ -33,7 +33,18 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Agent 管理接口
+ * ============================================================
+ * 【调用链路第1步】Agent 控制器 — HTTP API 入口
+ * ============================================================
+ * 角色：接收前端/IM 渠道的 HTTP 请求，转发给 AgentService 处理
+ *
+ * 关键端点：
+ * - GET  /api/v1/agents         → 列表查询
+ * - POST /api/v1/agents/{id}/chat/stream → 流式对话（SSE）
+ * - POST /api/v1/agents/{id}/chat        → 同步对话
+ * - POST /api/v1/agents/{id}/execute     → 任务执行
+ *
+ * 调用链：Controller → AgentService → getOrBuildAgent → StateGraphReActAgent → 图引擎
  *
  * @author MateClaw Team
  */
@@ -187,6 +198,12 @@ public class AgentController {
         return R.ok();
     }
 
+    /**
+     * 【核心入口】流式对话（SSE）
+     * 前端/IM 通过此端点发起对话 → agentService.chatStream()
+     * → getOrBuildAgentForConversation() → StateGraphReActAgent.chatStream()
+     * → compiledGraph.stream() → ReAct 循环开始执行
+     */
     @Operation(summary = "流式对话（SSE）")
     @GetMapping("/{id}/chat/stream")
     @RequireWorkspaceRole("viewer")

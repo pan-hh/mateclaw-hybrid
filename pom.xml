@@ -68,6 +68,10 @@
         <pdfbox.version>3.0.7</pdfbox.version>
         <pebble.version>4.1.1</pebble.version>
 
+        <!-- Vector store and search infrastructure -->
+        <elasticsearch.version>8.17.4</elasticsearch.version>
+        <milvus-sdk.version>2.4.14</milvus-sdk.version>
+
         <!-- Build plugin versions -->
         <maven-compiler-plugin.version>3.14.1</maven-compiler-plugin.version>
         <maven-dependency-plugin.version>3.8.1</maven-dependency-plugin.version>
@@ -321,6 +325,23 @@
                 <groupId>io.pebbletemplates</groupId>
                 <artifactId>pebble</artifactId>
                 <version>${pebble.version}</version>
+            </dependency>
+
+            <!-- ==================== Vector Store & Search ==================== -->
+            <dependency>
+                <groupId>co.elastic.clients</groupId>
+                <artifactId>elasticsearch-java</artifactId>
+                <version>${elasticsearch.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.elasticsearch.client</groupId>
+                <artifactId>elasticsearch-rest-client</artifactId>
+                <version>${elasticsearch.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.milvus</groupId>
+                <artifactId>milvus-sdk-java</artifactId>
+                <version>${milvus-sdk.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

@@ -315,3 +315,39 @@ mate:
       contradiction-check-enabled: false       # experimental simple detection, enable after LLM batch impl
       trust-half-life-days: 60
       forget-enabled: true
+  # 混合检索配置（Elasticsearch 全文 + Milvus 向量 + RRF 融合 + 熔断降级）
+  hybrid:
+    async:
+      core-pool-size: 4
+      max-pool-size: 8
+      queue-capacity: 1000
+      keep-alive-seconds: 60
+      thread-name-prefix: embedding-
+      await-termination-seconds: 60
+    milvus:
+      enabled: ${MILVUS_ENABLED:false}
+      host: ${MILVUS_HOST:localhost}
+      port: ${MILVUS_PORT:19530}
+      database: default
+      collection-prefix: workspace
+      dimension: 1024
+      index-type: HNSW
+      hnsw-m: 16
+      ef-construction: 200
+      ef: 100
+      connect-timeout: 5000
+      query-timeout: 30000
+      batch-size: 100
+      max-retries: 3
+    elasticsearch:
+      enabled: ${ES_ENABLED:false}
+      host: ${ES_HOST:localhost}
+      port: ${ES_PORT:9200}
+      scheme: http
+      username: ${ES_USERNAME:}
+      password: ${ES_PASSWORD:}
+      index-prefix: wiki
+      connect-timeout: 5000
+      socket-timeout: 30000
+      max-retry-timeout: 60000
+      batch-size: 100

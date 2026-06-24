@@ -101,31 +101,45 @@ public record LoopBudgetConfig(
     }
 
     /**
-     * Derive a sensible config from a model's context window. The ratios were
-     * chosen so the budgeter triggers well before the model's actual limit and
-     * leaves enough headroom for the LLM's own response.
+     * 从模型上下文窗口大小推导 L2 预算配置。
+     *
+     * <h3>参数推导策略</h3>
+     * <pre>
+     *   模型最大输入: contextWindowTokens (如 128000)
+     *   ┌──────────────────────────────────────────────────────────────┐
+     *   │                                            │               │
+     *   │   历史（可被裁剪的部分）                        │  预留前缀      │
+     *   │                                            │ (system+工具)  │
+     *   │  ┌────────────┬─────────────────────┐       │               │
+     *   │  │  丢弃部分   │   tail = 30% ~38K   │       │   ~20%        │
+     *   │  └────────────┴─────────────────────┘       │               │
+     *   │                                            │               │
+     *   │  trigger = 50% ~64K —— 与 L1 多轮压缩使用相同的阈值  │
+     *   └──────────────────────────────────────────────────────────────┘
+     * </pre>
      *
      * <ul>
-     *   <li>trigger = 50% of the window — same threshold the multi-turn
-     *       compressor uses, so the two layers stay calibrated.</li>
-     *   <li>tail budget = 30% of the window.</li>
-     *   <li>minTailMessages = 4 — at least one full reasoning/action cycle
-     *       stays visible to the LLM no matter how big a single tool output is.</li>
-     *   <li>tailSoftCeilingRatio = 1.5 — let the tail overshoot by 50% when
-     *       enforcing the floor or pulling back to keep a tool pair whole.</li>
-     *   <li>reservedPrefixTokens = 0 — caller should override with the real
-     *       prefix estimate; left at 0 the budget still works but errs on
-     *       the side of triggering later than it should.</li>
-     *   <li>targetMaxMessages = 200 — well above a normal ReAct loop's 20–40
-     *       working messages, low enough to be a meaningful guard rail.</li>
+     *   <li><b>trigger = 50%</b> — 与 L1 多轮压缩相同，保持两层校准一致</li>
+     *   <li><b>tail = 30%</b> — 近期消息的 token 预算，
+     *     at least one full reasoning/action cycle stays visible</li>
+     *   <li><b>minTailMessages = 4</b> — 最少保留4条，防止一条巨大工具输出
+     *     吃掉全部尾部 → 模型丢失最近的推理上下文</li>
+     *   <li><b>tailSoftCeilingRatio = 1.5</b> — 尾部可超预算 50%（如为了
+     *     保持 tool pair 完整性或满足最小消息数）</li>
+     *   <li><b>reservedPrefixTokens = 0</b> — 配置层只给消息预算；
+     *     调用方（ReasoningNode）会覆盖为真实的 system+工具估算值</li>
+     *   <li><b>targetMaxMessages = 200</b> — 远超正常 ReAct 20-40 条消息，
+     *     作为有意义的护栏而非主动触发项</li>
      * </ul>
      */
     public static LoopBudgetConfig forContext(int contextWindowTokens) {
         if (contextWindowTokens <= 0) {
+            // 避免除以零等异常情况
             contextWindowTokens = 32_000;
         }
         int trigger = Math.max(MIN_TRIGGER_TOKENS, (int) (contextWindowTokens * 0.50));
         int tail = Math.max(MIN_TAIL_TOKENS, (int) (contextWindowTokens * 0.30));
+        // 安全约束：tail 预算不能 ≥ trigger 阈值，否则预算裁剪零效果
         if (tail >= trigger) {
             tail = Math.max(MIN_TAIL_TOKENS, trigger - MIN_TRIGGER_TOKENS);
         }
